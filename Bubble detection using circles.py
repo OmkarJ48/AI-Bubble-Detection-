@@ -3,6 +3,8 @@
 Raspberry Pi 5 Camera Livestream Server
 
 """
+bubble_id_counter = 0
+tracked_bubbles = {}  # id -> (x, y)
 last_record_time = 0
 COOLDOWN = 2
 output = None
@@ -471,25 +473,47 @@ def frame_capture_thread():
             )
             if circles is not None:
                 circles = np.uint16(np.around(circles))
+                global bubble_id_counter, tracked_bubbles
+
+                new_tracked_bubbles = {}
+
 
                 for (x, y, r) in circles[0, :]:
+                    cx = x + x_offset
+                    cy = y + y_offset
+
+                    matched_id = None
+                    for bubble_id, (bx, by) in tracked_bubbles.items():
+                        distance = np.hypot(cx - bx, cy - by)
+                        if distance < 30:
+                            matched_id = bubble_id
+                            break
+
+                    if matched_id is None:
+                        bubble_id_counter += 1
+                        matched_id = bubble_id_counter
+
+                    new_tracked_bubbles[matched_id] = (cx, cy)
+
                     cv2.circle(
                         frame,
-                        (x + x_offset, y + y_offset),
+                        (cx, cy),
                         r,
                         (0, 255, 0),
                         2
                     )
-                    cv2.circle(
-                        frame,
-                        (x + x_offset, y + y_offset),
-                        2,
-                        (0, 0, 255), 3)
+                    cv2.putText(frame, f"ID: {matched_id}",
+                                (cx - 10, cy - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (255, 255, 0),
+                                2)
+                    tracked_bubbles = new_tracked_bubbles
                     cv2.putText(frame, "BUBBLES DETECTED",
                                 (10, 70),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 1,
-                                (0, 255, 255),
+                                (0, 255, 0),
                                 2)
                     cv2.rectangle(
                         frame,
