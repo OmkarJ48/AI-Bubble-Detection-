@@ -12,15 +12,22 @@ sudo raspi-config
 ## Installation
 
 ```bash
+
+#Uninstall all packages
+rm -rf venv
+
 # Create the virtual environment
-python3 -m venv venv
+python3 -m venv --system-site-packages venv
 
 # Activate it
 source venv/bin/activate
 
 # Install dependencies
 pip install picamera2 av flask werkzeug
+pip install flask pillow
 ```
+# Catching syntax errors
+python3 -m py_compile yourfile.py
 
 ## Usage
 
