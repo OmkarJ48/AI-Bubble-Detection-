@@ -34,6 +34,11 @@ node_modules/
 *.json
 !tools/tailwind/package.json
 !tools/tailwind/package-lock.json
+!profiles/*.json
 *.csv
 *.pdf
 *.mp4
+!Bubbles*.mp4
+*.mov
+*.MOV
+bubble_log*.jsonl
