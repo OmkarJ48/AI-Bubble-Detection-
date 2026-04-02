@@ -3,7 +3,7 @@
 This document tracks the current working tree in this folder as of 2026-04-02. It is focused on the newer bubble-detection workflow built around:
 
 - `livestream.py` for the Raspberry Pi live camera stream
-- `test_video.py` for offline validation against `Bubbles.mp4`
+- `test_video.py` for offline validation against `Bubbles.mp4` and `Bubbles2.mp4`
 
 The current code no longer matches the older README draft that described generic ROI tracking, motion detection, and recording controls. The sections below follow the behavior that is actually present in the code today.
 
@@ -21,18 +21,19 @@ The current code no longer matches the older README draft that described generic
 
 ### Video test harness: `test_video.py`
 
-- Reads `Bubbles.mp4` instead of the Raspberry Pi camera.
+- Reads a selected sample video instead of the Raspberry Pi camera.
+- Uses `Bubbles.mp4` by default and can also run `Bubbles2.mp4` with `--video`.
 - Reuses `detect_bubbles()` from `livestream.py`.
 - Runs a browser view with debug controls and a status endpoint.
 - Uses optional auto-centering to estimate the pipe center from the video.
-- Logs ended bubble events to `bubble_log.jsonl`.
+- Logs ended bubble events to a per-video JSONL file.
 
 ## Prerequisites
 
 - Raspberry Pi 5 with a working camera stack for `livestream.py`
 - Python 3
 - A clean virtual environment
-- `Bubbles.mp4` in this folder for `test_video.py`
+- `Bubbles.mp4` and `Bubbles2.mp4` in this folder for `test_video.py`
 
 The examples below assume your shell is in this directory:
 
@@ -134,17 +135,27 @@ With `DEBUG_DRAW = True`, the live stream draws:
 
 ### Run `test_video.py`
 
+Default sample video:
+
 ```bash
 python3 test_video.py
 ```
 
+Explicitly select `Bubbles2.mp4`:
+
+```bash
+python3 test_video.py --video Bubbles2.mp4
+```
+
 Current behavior:
 
-- Opens `Bubbles.mp4`
+- Opens `Bubbles.mp4` by default
+- Can switch to `Bubbles2.mp4` with `--video Bubbles2.mp4`
 - Streams the processed video at port `5001`
 - Loops back to the start when the video ends
 - Uses full-frame ROI for testing
 - Can auto-estimate the pipe center when `AUTO_CENTER_ENABLED = True`
+- Fails early if the selected video file does not exist or cannot be opened
 
 Browser access:
 
@@ -158,11 +169,13 @@ Browser access:
 - `POST /toggle_debug` flips the overlay state.
 - `POST /reset_counter` clears the counter, history, and active bubble.
 - `GET /status` reports the current UI state.
+- The page status line and the stream overlay show the active video filename so you can confirm which sample is running.
 
 Status response shape:
 
 ```json
 {
+  "video": "Bubbles2.mp4",
   "debug": true,
   "count": 0,
   "active_bubble": false,
@@ -170,11 +183,16 @@ Status response shape:
 }
 ```
 
-The test harness also appends ended bubble events to:
+The test harness appends ended bubble events to a log file derived from the selected video:
 
 ```text
-bubble_log.jsonl
+bubble_log_<video_stem>.jsonl
 ```
+
+Examples:
+
+- `Bubbles.mp4` -> `bubble_log_Bubbles.jsonl`
+- `Bubbles2.mp4` -> `bubble_log_Bubbles2.jsonl`
 
 Each log line is JSON and includes fields such as bubble ID, whether it was counted, start/end coordinates, seen frames, and end time.
 
@@ -269,9 +287,12 @@ Test harness:
 ## File outputs
 
 - Captured live images: `image_YYYYMMDD_HHMMSS.jpg`
-- Test-harness event log: `bubble_log.jsonl`
+- Test-harness event logs: `bubble_log_<video_stem>.jsonl`
 
-`Bubbles.mp4` is the sample input video used by `test_video.py`.
+Supported sample input videos for `test_video.py`:
+
+- `Bubbles.mp4`
+- `Bubbles2.mp4`
 
 ## Known issues and environment notes
 
@@ -289,5 +310,7 @@ Practical impact:
 - `livestream.py`
 - `test_video.py`
 - `Bubbles.mp4`
-- `bubble_log.jsonl`
+- `Bubbles2.mp4`
+- `bubble_log_Bubbles.jsonl`
+- `bubble_log_Bubbles2.jsonl`
 - `../requirements.txt`

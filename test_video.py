@@ -1,16 +1,21 @@
 import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+import argparse
+import atexit
 import json
 import time
-import cv2
-import numpy as np
+from pathlib import Path
+
 from flask import Flask, Response, jsonify, render_template_string
 
-from livestream import detect_bubbles
+cv2 = None
+np = None
+detect_bubbles = None
 
-VIDEO_PATH = "Bubbles.mp4"
-LOG_PATH = "bubble_log.jsonl"
+DEFAULT_VIDEO_PATH = "Bubbles.mp4"
+VIDEO_PATH = DEFAULT_VIDEO_PATH
+LOG_PATH = "bubble_log_Bubbles.jsonl"
 
 TARGET_FPS = 20
 LOCK_AFTER_FRAMES = 2
@@ -53,7 +58,7 @@ DEBUG_DRAW = True
 
 
 app = Flask(__name__)
-cap = cv2.VideoCapture(VIDEO_PATH)
+cap = None
 
 active_bubble = None
 bubble_history = []
@@ -127,7 +132,8 @@ HTML_PAGE = """
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('status').textContent =
-                        'Debug: ' + (data.debug ? 'ON' : 'OFF') +
+                        'Video: ' + data.video +
+                        ' | Debug: ' + (data.debug ? 'ON' : 'OFF') +
                         ' | Count: ' + data.count +
                         ' | Active bubble: ' + (data.active_bubble ? 'YES' : 'NO') +
                         ' | Auto center: ' + (data.auto_center ? 'ON' : 'OFF');
@@ -153,6 +159,55 @@ HTML_PAGE = """
 </body>
 </html>
 """
+
+
+def build_log_path(video_path):
+    return f"bubble_log_{Path(video_path).stem}.jsonl"
+
+
+def validate_video_path(video_path):
+    resolved_path = Path(video_path)
+    if not resolved_path.is_file():
+        raise SystemExit(f"Video file not found: {video_path}")
+    return str(resolved_path)
+
+
+def load_runtime_dependencies():
+    global cv2, np, detect_bubbles
+
+    import cv2 as cv2_module
+    import numpy as np_module
+    from livestream import detect_bubbles as detect_bubbles_func
+
+    cv2 = cv2_module
+    np = np_module
+    detect_bubbles = detect_bubbles_func
+
+
+def configure_video_source(video_path):
+    global VIDEO_PATH, LOG_PATH, cap
+
+    VIDEO_PATH = validate_video_path(video_path)
+    LOG_PATH = build_log_path(VIDEO_PATH)
+
+    if cap is not None:
+        cap.release()
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        raise SystemExit(f"Could not open video file: {VIDEO_PATH}")
+
+
+def cleanup_video_source():
+    global cap
+
+    if cap is not None:
+        cap.release()
+        cap = None
+
+
+def current_video_name():
+    return Path(VIDEO_PATH).name
 
 
 def distance(p1, p2):
@@ -446,8 +501,8 @@ def generate_frames():
         fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
 
         overlay = frame.copy()
-        box_width = 270
-        box_height = 135
+        box_width = 330
+        box_height = 160
         ox1 = frame.shape[1] - box_width - 10
         oy1 = 10
         ox2 = frame.shape[1] - 10
@@ -459,6 +514,7 @@ def generate_frames():
         y = oy1 + 22
         line_height = 20
         texts = [
+            f"Video: {current_video_name()}",
             f"FPS: {fps:.1f}",
             f"Frame: {frame_count}",
             f"Bubble: {1 if active_bubble is not None else 0}",
@@ -522,6 +578,7 @@ def reset_counter():
 @app.route("/status")
 def status():
     return jsonify({
+        "video": current_video_name(),
         "debug": DEBUG_DRAW,
         "count": bubble_count_total,
         "active_bubble": active_bubble is not None,
@@ -530,4 +587,18 @@ def status():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bubble video stream test harness")
+    parser.add_argument(
+        "--video",
+        default=DEFAULT_VIDEO_PATH,
+        help="Video file to play through the test harness (default: %(default)s)",
+    )
+    args = parser.parse_args()
+
+    atexit.register(cleanup_video_source)
+
+    validated_video_path = validate_video_path(args.video)
+    load_runtime_dependencies()
+    configure_video_source(validated_video_path)
+
     app.run(host="0.0.0.0", port=5001, threaded=True)
