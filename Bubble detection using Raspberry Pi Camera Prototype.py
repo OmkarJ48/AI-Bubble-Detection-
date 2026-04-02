@@ -3,28 +3,81 @@
 Raspberry Pi 5 Camera Livestream Server
 
 """
-last_record_time = 0
-COOLDOWN = 2
-output = None
-frame_count = 0
-motion_timer = 0
-motion_recording = False
-MOTION_RECORD_SECONDS = 3
-prev_frame = None
-motion_detected = False
+
+
+
 import io
 import threading
 import logging
 import time
 import numpy as np
 import cv2
-from picamera2.encoders import MJPEGEncoder
+
 from picamera2.outputs import FileOutput
-from picamera2 import Picamera2
+
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, render_template_string, Response, jsonify
 from PIL import Image
+
+# --- CONFIG ---
+
+COOLDOWN = 2
+output = None
+
+
+
+
+
+#motion_detected = False
+ 
+TARGET_FPS = 20
+FRAME_TIME = 1.0 / TARGET_FPS  # Limit to TARGET_FPS  
+
+ROI = (320, 120, 480, 360)
+CIRCLE_EVERY_N_FRAMES = 2
+
+
+
+
+
+
+# --- GLOBALS ---
+
+tracked_bubbles = {}
+bubble_counts = {}
+previous_positions = {}
+MIN_CONFIRM_FRAMES = 2
+
+bubble_id_counter = 0
+last_record_time = 0
+
+motion_timer = 0
+MOTION_RECORD_SECONDS = 3
+
+objects = {}
+
+def update_objects(ids):
+    now = time.time()
+
+    for obj_id in objects:
+        
+        objects[obj_id]["seen"] = False
+    
+    for obj_id in ids:
+        if obj_id not in objects:
+            objects[obj_id] = {"first_seen": now, "last_seen": now, "seen": True}
+        else:
+            objects[obj_id]["last_seen"] = now
+            objects[obj_id]["seen"] = True
+    
+    for obj_id in list(objects.keys()):
+        if not objects[obj_id]["seen"]: 
+           if now - objects[obj_id]["last_seen"] > 2:
+            del objects[obj_id]
+    
+   
+    
 
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
@@ -252,9 +305,13 @@ HTML_TEMPLATE = '''
         // Keep refreshing the stream
         function refreshStream() {
             const img = document.getElementById('stream');
+
+            img.onerror = () => {
+                showError("Stream disconnected");
+            };
             const now = new Date().getTime();
             img.src = '/video_feed?t=' + now;
-            streamTimeout = setTimeout(refreshStream, 200);
+            streamTimeout = setTimeout(refreshStream, 80);
         }
         
         function captureImage() {
@@ -326,7 +383,9 @@ HTML_TEMPLATE = '''
         }
         
         // Start streaming when page loads
-        window.addEventListener('load', refreshStream);
+        window.addEventListener('load', () => {
+            document.getElementById('stream').src = '/video_feed';
+        });
         window.addEventListener('beforeunload', () => clearTimeout(streamTimeout));
     </script>
 </body>
@@ -416,199 +475,328 @@ def stop_recording():
         return jsonify({'success': False, 'error': str(e)})
 
 
+
+def match_bubbles(detected, previous, max_dist=50):
+    """Match new detections to existing tracked bubbles."""
+    global bubble_id_counter
+
+    updated = {}
+
+    for (cx, cy, r, ) in detected:
+         best_id = None
+         best_dist = max_dist
+
+         for bubble_id, (px, py, _, _) in previous.items():
+             dist = np.hypot(cx - px, cy - py)
+             if dist < best_dist:
+                 best_dist = dist
+                 best_id = bubble_id_counter
+        
+         if best_id is None:
+            bubble_id_counter += 1
+            best_id = bubble_id_counter
+        
+          # ⚡ ADD TIME HERE
+         updated[best_id] = (cx, cy, r, time.time()) 
+         
+    return updated
+
+def detect_bubbles(small_gray, scale_x, scale_y, x_offset, y_offset):
+    small_gray = cv2.GaussianBlur(small_gray, (5, 5), 0)
+    """Detect circles and filter noise."""
+    circles = cv2.HoughCircles(
+        small_gray,
+        cv2.HOUGH_GRADIENT,
+        dp=2.0,
+        minDist=50,
+        param1=80,
+        param2 =20,
+        minRadius=6,
+        maxRadius=20
+    )
+
+    results = []
+
+    if circles is None:
+        return results
+    
+    circles = np.uint16(np.around(circles))
+    
+
+
+    for (x, y, r) in circles[0]:
+        if y >= small_gray.shape[0] or x >= small_gray.shape[1]:
+            continue
+
+        if small_gray[y, x] < 150:
+            continue
+
+        cx = int(x * scale_x) + x_offset
+        cy = int(y * scale_y) + y_offset
+
+        results.append((cx, cy, r,))
+
+    return results
+
+    
 def frame_capture_thread():
     """Continuously capture frames from camera."""
-    global prev_frame, motion_recording, motion_timer, motion_detected, last_record_time
+    global prev_frame,  motion_detected,  tracked_bubbles, ROI, ROI_LOCKED
+    
+    last_boxes =[]
+    
+    
+   
+   
+
+    
+    frame_count = 0
+    FRAME_TIME = 1.0 / 30  # Limit to 30 FPS
+
+    boxes = None # safe init
+    
     print("THREAD STARTED")
     logger.info("Frame capture thread started")
-  
+    
+    
+    last_detect_time = 0
 
-    frame_count = 0
-
+    
     while streaming:
+        start_time = time.time()
         #print("STREAMING:", streaming)
         #print("Frame captue thread running...")          
         try:
             frame_count += 1
             
-            if frame_count % 3 != 0:
-                time.sleep(0.08)
-                continue
-            frame = camera.capture_array("lores")
-           
-            #print("Frame captured")
-            #frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-           
-            if len(frame.shape) == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            request_obj = camera.capture_request()
+
+            frame = camera.capture_array("main")   # HD
+            lores = camera.capture_array("lores")  # Low-res
             
+            request_obj.release()
+      
+            
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(lores, cv2.COLOR_RGB2GRAY)
+            small = cv2.resize(gray, (64, 48))
+            
+            boxes = None
+            
+            if frame_count % 2 == 0:
+                
+                continue
+           
+          
+             # --- ROI ---
             h, w = frame.shape[:2]
-
-            x_offset = min(200, w-1)
-            y_offset = min(100, h-1)
             
-            roi_width = min(400, w - x_offset)
-            roi_height = min(300, h - y_offset)
+            x1, y1, x2, y2 = ROI
 
-            roi = frame[y_offset:y_offset + roi_height, x_offset:x_offset + roi_width]
-
-            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-            gray = cv2.GaussianBlur(gray, (9, 9), 0)
-        
-
-            if prev_frame is None:
-                prev_frame = gray
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(w, x2)
+            y2 = min(h, y2)
+            
+            # Validate BEFORE crop
+            if x2 <= x1 or y2 <= y1:
+                print("Invalid ROI coordinates, skipping frame")
                 continue
-            circles = cv2.HoughCircles(
-                gray,
-                cv2.HOUGH_GRADIENT,
-                dp=1.2,
-                minDist=30,
-                param1=50,
-                param2=15,
-                minRadius=5,
-                maxRadius=100
-            )
-            if circles is not None:
-                circles = np.uint16(np.around(circles))
 
-                for (x, y, r) in circles[0, :]:
-                    cv2.circle(
-                        frame,
-                        (x + x_offset, y + y_offset),
-                        r,
-                        (0, 255, 0),
-                        2
-                    )
-                    cv2.circle(
-                        frame,
-                        (x + x_offset, y + y_offset),
-                        2,
-                        (0, 0, 255), 3)
-                    cv2.putText(frame, "BUBBLES DETECTED",
-                                (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1,
-                                (0, 255, 255),
-                                2)
-                    cv2.rectangle(
-                        frame,
-                        (x + x_offset - 5, y + y_offset - 5),
-                        (x + x_offset + 5, y + y_offset + 5),
-                        (255, 0, 255),
-                        -1
-                    )
-            frame_delta = cv2.absdiff(prev_frame, gray)
-            prev_frame = gray
+            roi = frame[y1:y2, x1:x2]
 
-            #print("Delta mean:", np.mean(frame_delta))
-
-            thresh = cv2.threshold(frame_delta, 15, 255, cv2.THRESH_BINARY)[1]
-            thresh = cv2.dilate(thresh, None, iterations=2)
-
-            contours, _ = cv2.findContours(
-                thresh,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            #print("Contours found:", len(contours))
-
-            motion_detected = any(cv2.contourArea(c) > 1500 for c in contours)
-
-            for contour in contours:
-                if cv2.contourArea(contour) <1500:
-                    continue
-              
-
-
-                motion_detected = True
-
-                (x, y, w, h) = cv2.boundingRect(contour)
-                cv2.rectangle(
-                    frame,
-                    (x + x_offset, y + y_offset),
-                    (x + w + x_offset, y + h + y_offset),
-                    (0, 255, 0),
-                    2
-    )
-                cv2.rectangle(
-                    frame,
-                    (x_offset, y_offset),
-                    (x_offset + roi_width, y_offset + roi_height),
-                    (255, 0, 0),
-                    2
-                )
-
-            if motion_detected:
-                motion_timer = time.time()
-                print("MOTION!")
-                cv2.putText(frame, "MOTION DETECTED",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 0, 255),
-                            2)
-            if motion_recording:
-                if time.time() - motion_timer > MOTION_RECORD_SECONDS :
-                    print("Stopping motion recording")
-
-                    try:
-                        camera.stop_recording(name="main")
-                        
-                        motion_recording = False
-                        recording = False
-                        last_record_time = time.time()
-                        
-
-
-                        
-                    except Exception as e:
-                        print("Error stopping recording:", e)
-                        time.sleep(0.08)
-            if motion_detected and not motion_recording and time.time() - last_record_time > COOLDOWN:
-                print("Starting motion recording")
-                try:
-                    
-
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"motion_{timestamp}.mp4"
-
-                    encoder = H264Encoder(bitrate=10000000)
-                    file_output = FfmpegOutput(filename)    
-                    
-                    camera.start_recording(encoder, file_output, name="main")
-                    
-                    motion_recording = True
-                    recording = True    
-                    motion_timer = time.time()
-
-                    
-                except Exception as e:
-                    print("Error starting motion recording:", e)
+            if roi.size == 0:
+                print("Empty ROI, skipping frame")
+                continue
             
-            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        (10, frame.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2)
-        
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if ret:
-                output.write(jpeg.tobytes())
+            if roi.shape[0] < 20 or roi.shape[1] < 20:
+                print("ROI too small, skipping frame")
+                continue
+            
+            roi_h, roi_w = roi.shape[:2]
+            x_offset, y_offset = x1, y1
 
-            time.sleep(0.08)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.putText(frame, "ROI Active", (x1, y1 - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            
+            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY) 
+            small = cv2.resize(gray, (64, 48), interpolation=cv2.INTER_AREA)
+           
+            # --- Bubble detection ---
+            detections = []
+       
+           
+
+           
+                
+            if time.time() - last_detect_time > 0.15:
+
+                detections = detect_bubbles(
+                    small_gray=small,
+                    scale_x=roi_w/64, 
+                    scale_y=roi_h/48, 
+                    x_offset=x_offset, 
+                    y_offset=y_offset
+                ) 
+                
+                last_detect_time = time.time()
+                
+                # Filters
+
+                detections = [(cx, cy, r) for (cx, cy, r) in detections if 10 < r < 20]
+
+                pipe_center_x = x_offset + (roi_w // 2)
+
+                cv2.line(frame, 
+                         (pipe_center_x, y1), 
+                         (pipe_center_x, y2), 
+                         (255, 255, 0), 1)
+                
+                detections = [(cx, cy, r) for (cx, cy, r) in detections if abs(cx - pipe_center_x) < 40]
+
+                for (cx, cy, r) in detections:
+                    cv2.circle(frame, (cx, cy), int(r), (0, 255, 255), 2)
+            
+            if time.time() - last_detect_time > 0.15:
+                detections = detect_bubbles(
+                    small_gray=small,
+                    scale_x=roi_w/64, 
+                    scale_y=roi_h/48, 
+                    x_offset=x_offset, 
+                    y_offset=y_offset
+                )
+                last_detect_time = time.time()
+                matched = match_bubbles(detections, tracked_bubbles)
+                
+                for (cx, cy, r) in detections:
+                    cv2.circle(frame, (cx, cy), r, (0, 255, 255), 1)
+                
+                # Tracking
+
+                now = time.time()
+                updated_bubbles = {}
+
+                for bid, (cx, cy, r, t) in matched.items():
+                    
+                    
+                    # Smooth movement (optional but good)
+                    if bid in tracked_bubbles:
+                        old_x, old_y, _, _= tracked_bubbles[bid]
+
+                        cx = int(0.7 * old_x + 0.3 * cx)
+                        cy = int(0.7 * old_y + 0.3 * cy)
+                    
+                    #Update count
+                    bubble_counts[bid] = bubble_counts.get(bid, 0) + 1
+
+                    #Only accept stable bubbles
+                    if bubble_counts[bid] >= MIN_CONFIRM_FRAMES:
+                         updated_bubbles[bid] = (cx, cy, r, now)
+
+                tracked_bubbles = updated_bubbles
                 
 
+           
+            for bid in list(tracked_bubbles.keys()):
+                _, _, _, t = tracked_bubbles[bid]
+
+                if now - t > 2.0:
+                    del tracked_bubbles[bid]
+                    bubble_counts.pop(bid, None)
+            
+            # Only keep upward movement
+            filtered_bubbles={}
+
+            for bid, (cx, cy, r, t) in tracked_bubbles.items():
+                
+                
+                if bid in previous_positions:
+                    
+
+                    #keep only upward movement
+                    if cy < previous_positions[bid]: #moving up
+                        filtered_bubbles[bid] = (cx, cy, r, t)
+                
+                previous_positions[bid] = cy
+            
+            tracked_bubbles = filtered_bubbles
+               
+            # --- Draw bubbles ---  
+            
+            for bid, (cx, cy, r, now) in tracked_bubbles.items():
+                cv2.circle(frame, (cx, cy), 10, (0, 255, 0), 2)
+                
+               
+
+        
+                if prev_frame is None:
+                    prev_frame = gray
+                    continue         
+            
+
+            # --- Motion detection ---
+            #if prev_frame is None or gray.shape != prev_frame.shape:
+                #prev_frame = gray.copy()
+                #continue
+            
+            #delta = cv2.absdiff(prev_frame, gray)
+            
+            #prev_frame = gray
+
+            #thresh = cv2.threshold(delta, 15, 255, cv2.THRESH_BINARY)[1]
+            #thresh = cv2.dilate(thresh, None, iterations=2)
+
+            #contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+           #motion_detected = any(cv2.contourArea(c) > 1500 for c in contours)
+
+            # --- Overlay ---
+            
+            
+            # Frame counter (TOP-LEFT)
+            
+            y = 30
+            
+            cv2.rectangle(frame, (5, 5), (180, 100), (0,0,0), -1)
+            cv2.putText(frame, f"Frame: {frame_count}", (10, y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255, 0), 2)
+           
+            # FPS (TOP-LEFT)
+            fps = 1.0 / (time.time() - start_time)
+            
+            y +=30
+            
+            cv2.rectangle(frame, (5, 5), (180, 100), (0,0,0), -1)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255, 0), 2)
+            
+            # Timestamp (TOP-LEFT)
+           
+            y +=30
+
+            cv2.rectangle(frame, (5, 5), (180, 100), (0,0,0), -1)
+            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                        (10, y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255, 0), 2)
+
+            # --- Encode and stream ---
+            ret, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            if ret:
+                with output.condition:
+                    output.frame = jpeg.tobytes()
+                    output.condition.notify_all()
+
+            # ---FPS Limiter---
+            elapsed = time.time() - start_time
+            if elapsed < FRAME_TIME:
+                time.sleep(FRAME_TIME - elapsed)
         except Exception as e:
-            print("ERROR:", e)
-            time.sleep(0.08)
+            print("Thread error:", e)
 
-
-def initialize_camera(resolution=(320, 240), fps=20):
+def initialize_camera(resolution=(960, 540), fps=30):
     """Initialize the camera."""
-    global camera, streaming, output, motion_detected
+    global camera, streaming, output
     
 
     try:
@@ -616,9 +804,19 @@ def initialize_camera(resolution=(320, 240), fps=20):
         camera = Picamera2()
         
         config = camera.create_video_configuration(
-            main={"size": resolution},   
-            lores={"size": (320, 240), "format": "RGB888"},
-            encode="main"
+            main={
+                "size": resolution,   
+            },
+            lores={
+                "size": (320, 240), 
+                "format": "RGB888"
+            },
+            controls={
+                "FrameRate": fps,
+            },
+            buffer_count=2
+            
+           
         )
         camera.configure(config)
         
@@ -635,14 +833,19 @@ def initialize_camera(resolution=(320, 240), fps=20):
         
         streaming = True
         
-
+        time.sleep(0.5)  # Allow camera to warm up
         
         # Start frame capture thread
-        capture_thread = threading.Thread(target=frame_capture_thread, daemon=True)
+        capture_thread = threading.Thread(
+            target=frame_capture_thread, 
+            daemon=True
+            )
+        
         capture_thread.start()
         
         logger.info(f"Camera initialized: {resolution} @ {fps}fps")
         return True
+    
     except Exception as e:
         logger.error(f"Error initializing camera: {e}")
         return False
@@ -650,18 +853,28 @@ def initialize_camera(resolution=(320, 240), fps=20):
 
 def cleanup_camera():
     """Clean up camera resources."""
-    global camera, streaming
+    global camera, streaming, recording
     
     streaming = False
-    time.sleep(0.08)
+    
+    # Give thread time to exit
+    time.sleep(0.2)
     
     if camera:
         try:
             if recording:
-                camera.stop_recording(name="main")
+                try:
+                    camera.stop_recording()
+                except Exception:
+                    pass
+                recording = False
+           
             camera.stop()
             camera.close()
+            camera = None
+
             logger.info("Camera cleaned up")
+        
         except Exception as e:
             logger.error(f"Error cleaning up camera: {e}")
     
@@ -670,13 +883,14 @@ def cleanup_camera():
         import os
         if os.path.exists("temp_frame.jpg"):
             os.remove("temp_frame.jpg")
-    except:
+    except Exception:
         pass
+
 
 
 if __name__ == '__main__':
     import argparse
-    
+    import atexit
     parser = argparse.ArgumentParser(
         description="Raspberry Pi 5 Camera Livestream Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -692,7 +906,7 @@ EXAMPLES:
   python3 livestream.py --port 8080
   
   # Custom resolution
-  python3 livestream.py --resolution 1280 720
+  python3 livestream.py --resolution 960 540
   
 ACCESS FROM BROWSER:
   Local: http://localhost:5000
@@ -700,25 +914,39 @@ ACCESS FROM BROWSER:
         """
     )
     
-    parser.add_argument('-p', '--port', type=int, default=5000,
-                        help='Port to run server on (default: 5000)')
-    parser.add_argument('-H', '--host', type=str, default='127.0.0.1',
-                        help='Host to bind to (default: 127.0.0.1)')
-    parser.add_argument('-r', '--resolution', type=int, nargs=2, default=[640, 480],
-                        metavar=('WIDTH', 'HEIGHT'),
-                        help='Camera resolution (default: 640 480)')
-    parser.add_argument('-f', '--fps', type=int, default=30,
-                        help='Framerate in fps (default: 30)')
+    parser.add_argument('-p', '--port', type=int, default=5000)
+                      
+    parser.add_argument('-H', '--host', type=str, default='127.0.0.1')
+                       
+    parser.add_argument('-r', '--resolution', type=int, nargs=2, default=[960, 540])
+                       
+    parser.add_argument('-f', '--fps', type=int, default=30)
+                       
     
     args = parser.parse_args()
+
+    # ✅ ALWAYS cleanup on exit
+    atexit.register(cleanup_camera)
     
     try:
         if initialize_camera(tuple(args.resolution), args.fps):
             logger.info(f"🚀 Starting livestream server on http://{args.host}:{args.port}")
-            app.run(host=args.host, port=args.port, debug=False, threaded=True)
+            
+            app.run(
+                host=args.host, 
+                port=args.port, 
+                debug=False, 
+                threaded=True,
+                use_reloader=False # ✅ ALWAYS cleanup on exit
+            )
+    
     except KeyboardInterrupt:
         logger.info("Shutting down...")
-        cleanup_camera()
+        
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+    finally:
+        #✅ GUARANTEED cleanup   
         cleanup_camera()
+
+

@@ -548,6 +548,13 @@ def frame_capture_thread():
                     
                 except Exception as e:
                     print("Error starting motion recording:", e)
+            
+            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        (10, frame.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2)
         
             ret, jpeg = cv2.imencode('.jpg', frame)
             if ret:
