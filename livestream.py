@@ -8,16 +8,20 @@ Single-bubble pipe-locked tracker:
 """
 
 import io
+import json
 import threading
 import logging
 import time
-import numpy as np
-import cv2
+from pathlib import Path
 
 from datetime import datetime
 from flask import Flask, render_template_string, Response, jsonify
 
 output = None
+cv2 = None
+np = None
+Picamera2 = None
+PROFILE_PATH = None
 
 # =========================
 # GLOBAL STATE / TUNING
@@ -69,6 +73,35 @@ DEBUG_DRAW = True
 
 frame_lock = threading.Lock()
 
+SHARED_PROFILE_FIELDS = {
+    "pipe_center_x_bias": "PIPE_CENTER_X_BIAS",
+    "pipe_width_ratio": "PIPE_WIDTH_RATIO",
+    "pipe_lock_width_ratio": "PIPE_LOCK_WIDTH_RATIO",
+    "pipe_top_ratio": "PIPE_TOP_RATIO",
+    "pipe_bottom_ratio": "PIPE_BOTTOM_RATIO",
+    "pipe_exit_ratio": "PIPE_EXIT_RATIO",
+    "count_band_half": "COUNT_BAND_HALF",
+}
+
+LIVESTREAM_PROFILE_FIELDS = {
+    "target_fps": "TARGET_FPS",
+    "roi_x1": "ROI_X1",
+    "roi_y1": "ROI_Y1",
+    "roi_x2": "ROI_X2",
+    "roi_y2": "ROI_Y2",
+    "lock_after_frames": "LOCK_AFTER_FRAMES",
+    "lost_after_frames": "LOST_AFTER_FRAMES",
+    "min_upward_travel": "MIN_UPWARD_TRAVEL",
+    "max_match_distance": "MAX_MATCH_DISTANCE",
+    "downward_tolerance": "DOWNWARD_TOLERANCE",
+    "detect_interval": "DETECT_INTERVAL",
+    "min_radius": "MIN_RADIUS",
+    "max_radius": "MAX_RADIUS",
+    "spawn_band_half": "SPAWN_BAND_HALF",
+    "count_band_half": "COUNT_BAND_HALF",
+    "debug_draw": "DEBUG_DRAW",
+}
+
 
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
@@ -80,12 +113,6 @@ class StreamingOutput(io.BufferedIOBase):
             self.frame = buf
             self.condition.notify_all()
 
-
-try:
-    from picamera2 import Picamera2
-except ImportError:
-    print("Error: picamera2 is not installed")
-    raise SystemExit(1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -351,6 +378,62 @@ def capture():
 
 def distance(p1, p2):
     return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
+
+
+def validate_profile_path(profile_path):
+    resolved_path = Path(profile_path)
+    if not resolved_path.is_file():
+        raise SystemExit(f"Profile file not found: {profile_path}")
+    return str(resolved_path)
+
+
+def load_profile_data(profile_path):
+    with open(profile_path, "r", encoding="utf-8") as profile_file:
+        data = json.load(profile_file)
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Profile must be a JSON object: {profile_path}")
+
+    return data
+
+
+def apply_profile_mapping(profile_section, mapping):
+    if not isinstance(profile_section, dict):
+        return
+
+    for key, global_name in mapping.items():
+        if key in profile_section:
+            globals()[global_name] = profile_section[key]
+
+
+def apply_livestream_profile(profile_path):
+    global PROFILE_PATH
+
+    PROFILE_PATH = validate_profile_path(profile_path)
+    profile_data = load_profile_data(PROFILE_PATH)
+
+    apply_profile_mapping(profile_data.get("shared", {}), SHARED_PROFILE_FIELDS)
+    apply_profile_mapping(profile_data.get("livestream", {}), LIVESTREAM_PROFILE_FIELDS)
+
+
+def load_runtime_dependencies(require_camera=True):
+    global cv2, np, Picamera2
+
+    if np is None:
+        import numpy as np_module
+        np = np_module
+
+    if cv2 is None:
+        import cv2 as cv2_module
+        cv2 = cv2_module
+
+    if require_camera and Picamera2 is None:
+        try:
+            from picamera2 import Picamera2 as picamera2_class
+        except ImportError:
+            print("Error: picamera2 is not installed")
+            raise SystemExit(1)
+        Picamera2 = picamera2_class
 
 
 def detect_bubbles(small_gray, scale_x, scale_y, x_offset, y_offset):
@@ -707,6 +790,7 @@ def initialize_camera(resolution=(960, 540), fps=30):
     global camera, streaming, output
 
     try:
+        load_runtime_dependencies(require_camera=True)
         logger.info("Initializing camera...")
         camera = Picamera2()
 
@@ -792,11 +876,18 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--host", type=str, default="127.0.0.1")
     parser.add_argument("-r", "--resolution", type=int, nargs=2, default=[960, 540])
     parser.add_argument("-f", "--fps", type=int, default=30)
+    parser.add_argument(
+        "--profile",
+        help="Profile file to load for live camera tuning overrides",
+    )
     args = parser.parse_args()
 
     atexit.register(cleanup_camera)
 
     try:
+        if args.profile:
+            apply_livestream_profile(args.profile)
+
         if initialize_camera(tuple(args.resolution), args.fps):
             logger.info("Starting livestream server on http://%s:%s", args.host, args.port)
             app.run(

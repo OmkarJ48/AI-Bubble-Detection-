@@ -16,6 +16,7 @@ detect_bubbles = None
 DEFAULT_VIDEO_PATH = "Bubbles.mp4"
 VIDEO_PATH = DEFAULT_VIDEO_PATH
 LOG_PATH = "bubble_log_Bubbles.jsonl"
+PROFILE_PATH = None
 
 TARGET_FPS = 20
 LOCK_AFTER_FRAMES = 2
@@ -52,6 +53,7 @@ MAX_MATCH_DISTANCE = 60
 AUTO_CENTER_ENABLED = True
 AUTO_CENTER_SMOOTHING = 0.80   # higher = more stable, less reactive
 CENTER_SEARCH_WIDTH_RATIO = 0.35
+AUTO_CENTER_MAX_OFFSET_PX = 120
 
 # Debug overlay
 DEBUG_DRAW = True
@@ -160,9 +162,39 @@ HTML_PAGE = """
 </html>
 """
 
+SHARED_PROFILE_FIELDS = {
+    "pipe_center_x_bias": "PIPE_CENTER_X_BIAS",
+    "pipe_width_ratio": "PIPE_WIDTH_RATIO",
+    "pipe_lock_width_ratio": "PIPE_LOCK_WIDTH_RATIO",
+    "pipe_top_ratio": "PIPE_TOP_RATIO",
+    "pipe_bottom_ratio": "PIPE_BOTTOM_RATIO",
+    "pipe_exit_ratio": "PIPE_EXIT_RATIO",
+    "count_band_half": "COUNT_BAND_HALF",
+}
+
+TEST_VIDEO_PROFILE_FIELDS = {
+    "target_fps": "TARGET_FPS",
+    "lock_after_frames": "LOCK_AFTER_FRAMES",
+    "lost_after_frames": "LOST_AFTER_FRAMES",
+    "min_travel_y": "MIN_TRAVEL_Y",
+    "detect_every_seconds": "DETECT_EVERY_SECONDS",
+    "min_radius": "MIN_RADIUS",
+    "max_radius": "MAX_RADIUS",
+    "max_match_distance": "MAX_MATCH_DISTANCE",
+    "auto_center_enabled": "AUTO_CENTER_ENABLED",
+    "auto_center_smoothing": "AUTO_CENTER_SMOOTHING",
+    "center_search_width_ratio": "CENTER_SEARCH_WIDTH_RATIO",
+    "auto_center_max_offset_px": "AUTO_CENTER_MAX_OFFSET_PX",
+    "debug_draw": "DEBUG_DRAW",
+}
+
 
 def build_log_path(video_path):
     return f"bubble_log_{Path(video_path).stem}.jsonl"
+
+
+def build_default_profile_path(video_path):
+    return Path("profiles") / f"{Path(video_path).stem}.json"
 
 
 def validate_video_path(video_path):
@@ -172,12 +204,71 @@ def validate_video_path(video_path):
     return str(resolved_path)
 
 
+def validate_profile_path(profile_path):
+    resolved_path = Path(profile_path)
+    if not resolved_path.is_file():
+        raise SystemExit(f"Profile file not found: {profile_path}")
+    return str(resolved_path)
+
+
+def resolve_profile_path(video_path, explicit_profile_path=None):
+    if explicit_profile_path is not None:
+        return validate_profile_path(explicit_profile_path)
+
+    default_profile = build_default_profile_path(video_path)
+    if default_profile.is_file():
+        return str(default_profile)
+
+    fallback_profile = Path("profiles") / "Bubbles.json"
+    if fallback_profile.is_file():
+        return str(fallback_profile)
+
+    raise SystemExit(
+        f"No profile found for {video_path}. Expected {default_profile} "
+        "or fallback profiles/Bubbles.json."
+    )
+
+
+def load_profile_data(profile_path):
+    with open(profile_path, "r", encoding="utf-8") as profile_file:
+        data = json.load(profile_file)
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Profile must be a JSON object: {profile_path}")
+
+    return data
+
+
+def apply_profile_mapping(profile_section, mapping):
+    if not isinstance(profile_section, dict):
+        return
+
+    for key, global_name in mapping.items():
+        if key in profile_section:
+            globals()[global_name] = profile_section[key]
+
+
+def apply_test_video_profile(profile_path):
+    global PROFILE_PATH
+
+    PROFILE_PATH = validate_profile_path(profile_path)
+    profile_data = load_profile_data(PROFILE_PATH)
+
+    apply_profile_mapping(profile_data.get("shared", {}), SHARED_PROFILE_FIELDS)
+    apply_profile_mapping(profile_data.get("test_video", {}), TEST_VIDEO_PROFILE_FIELDS)
+
+
 def load_runtime_dependencies():
     global cv2, np, detect_bubbles
 
     import cv2 as cv2_module
     import numpy as np_module
-    from livestream import detect_bubbles as detect_bubbles_func
+    from livestream import (
+        detect_bubbles as detect_bubbles_func,
+        load_runtime_dependencies as load_livestream_runtime_dependencies,
+    )
+
+    load_livestream_runtime_dependencies(require_camera=False)
 
     cv2 = cv2_module
     np = np_module
@@ -269,6 +360,10 @@ def estimate_pipe_center_x(gray_roi, fallback_center_x, previous_center_x=None):
         estimated = int(np.mean([x for _, x in best]))
     else:
         estimated = fallback_center_x
+
+    min_center_x = fallback_local_x - AUTO_CENTER_MAX_OFFSET_PX
+    max_center_x = fallback_local_x + AUTO_CENTER_MAX_OFFSET_PX
+    estimated = max(min_center_x, min(max_center_x, estimated))
 
     if previous_center_x is None:
         return estimated
@@ -593,11 +688,23 @@ if __name__ == "__main__":
         default=DEFAULT_VIDEO_PATH,
         help="Video file to play through the test harness (default: %(default)s)",
     )
+    parser.add_argument(
+        "--profile",
+        help=(
+            "Profile file to load. Defaults to profiles/<video_stem>.json "
+            "or profiles/Bubbles.json."
+        ),
+    )
     args = parser.parse_args()
 
     atexit.register(cleanup_video_source)
 
     validated_video_path = validate_video_path(args.video)
+    resolved_profile_path = resolve_profile_path(
+        validated_video_path,
+        explicit_profile_path=args.profile,
+    )
+    apply_test_video_profile(resolved_profile_path)
     load_runtime_dependencies()
     configure_video_source(validated_video_path)
 
