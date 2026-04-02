@@ -116,6 +116,12 @@ Section meaning:
 
 This lets us tune a video offline first, then reuse the same profile in the live camera workflow.
 
+Current calibration status:
+
+- `Bubbles.mp4` remains the baseline reference profile
+- `Bubbles2.mp4` now has a dedicated test-harness alignment profile for pipe centering
+- `Bubbles3.mp4` to `Bubbles6.mp4` are still pending individual tuning passes
+
 ## Live camera app
 
 Default run:
@@ -254,6 +260,8 @@ The current profiles cover these main groups:
 - match-distance and count thresholds
 - auto-centering values for `test_video.py`
 - ROI and live-only detection thresholds for `livestream.py`
+
+For `test_video.py`, the auto-centering controls now include a maximum fallback offset clamp so per-video profiles can keep reflections from pulling the overlay away from the main pipe.
 
 Common baseline values currently used in the seeded profiles include:
 

@@ -53,6 +53,7 @@ MAX_MATCH_DISTANCE = 60
 AUTO_CENTER_ENABLED = True
 AUTO_CENTER_SMOOTHING = 0.80   # higher = more stable, less reactive
 CENTER_SEARCH_WIDTH_RATIO = 0.35
+AUTO_CENTER_MAX_OFFSET_PX = 120
 
 # Debug overlay
 DEBUG_DRAW = True
@@ -183,6 +184,7 @@ TEST_VIDEO_PROFILE_FIELDS = {
     "auto_center_enabled": "AUTO_CENTER_ENABLED",
     "auto_center_smoothing": "AUTO_CENTER_SMOOTHING",
     "center_search_width_ratio": "CENTER_SEARCH_WIDTH_RATIO",
+    "auto_center_max_offset_px": "AUTO_CENTER_MAX_OFFSET_PX",
     "debug_draw": "DEBUG_DRAW",
 }
 
@@ -358,6 +360,10 @@ def estimate_pipe_center_x(gray_roi, fallback_center_x, previous_center_x=None):
         estimated = int(np.mean([x for _, x in best]))
     else:
         estimated = fallback_center_x
+
+    min_center_x = fallback_local_x - AUTO_CENTER_MAX_OFFSET_PX
+    max_center_x = fallback_local_x + AUTO_CENTER_MAX_OFFSET_PX
+    estimated = max(min_center_x, min(max_center_x, estimated))
 
     if previous_center_x is None:
         return estimated
