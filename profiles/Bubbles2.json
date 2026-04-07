@@ -1,8 +1,8 @@
 {
   "shared": {
     "pipe_center_x_bias": -25,
-    "pipe_width_ratio": 0.14,
-    "pipe_lock_width_ratio": 0.06,
+    "pipe_width_ratio": 0.35,
+    "pipe_lock_width_ratio": 0.18,
     "pipe_top_ratio": 0.25,
     "pipe_bottom_ratio": 0.75,
     "pipe_exit_ratio": 0.55,
