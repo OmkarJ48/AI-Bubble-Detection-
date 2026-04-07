@@ -1,22 +1,16 @@
 import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-import argparse
-import atexit
 import json
 import time
-from pathlib import Path
-
+import cv2
+import numpy as np
 from flask import Flask, Response, jsonify, render_template_string
 
-cv2 = None
-np = None
-detect_bubbles = None
+from livestream import detect_bubbles
 
-DEFAULT_VIDEO_PATH = "Bubbles.mp4"
-VIDEO_PATH = DEFAULT_VIDEO_PATH
-LOG_PATH = "bubble_log_Bubbles.jsonl"
-PROFILE_PATH = None
+VIDEO_PATH = "Bubbles2.mp4"
+LOG_PATH = "bubble_log.jsonl"
 
 TARGET_FPS = 20
 LOCK_AFTER_FRAMES = 2
@@ -24,45 +18,41 @@ LOST_AFTER_FRAMES = 3
 MIN_TRAVEL_Y = 18
 
 # ---- PIPE TUNING ----
-# Verified manual fallback
 PIPE_CENTER_X_BIAS = -50
 
-# Width / lock zone ratios
 PIPE_WIDTH_RATIO = 0.35
 PIPE_LOCK_WIDTH_RATIO = 0.18
 
-# Vertical pipe region
 PIPE_TOP_RATIO = 0.25
 PIPE_BOTTOM_RATIO = 0.75
 PIPE_EXIT_RATIO = 0.55
 
-# Count band thickness
 COUNT_BAND_HALF = 12
 
-# Detection timing
 DETECT_EVERY_SECONDS = 0.10
 
-# Bubble size filter
 MIN_RADIUS = 10
 MAX_RADIUS = 20
-
-# Match distance
 MAX_MATCH_DISTANCE = 60
 
-# Auto center calibration
 AUTO_CENTER_ENABLED = True
-AUTO_CENTER_SMOOTHING = 0.80   # higher = more stable, less reactive
+AUTO_CENTER_SMOOTHING = 0.80
 CENTER_SEARCH_WIDTH_RATIO = 0.35
-AUTO_CENTER_MAX_OFFSET_PX = 120
 
-# Debug overlay
 DEBUG_DRAW = True
+
+# ---- NOISE / FALSE-START CONTROL ----
+STARTUP_IGNORE_FRAMES = 8
+CANDIDATE_CONFIRM_FRAMES = 2
+CANDIDATE_MATCH_DISTANCE = 50
+MIN_START_BELOW_EXIT = 18   # new bubble must start this many px below exit line
 
 
 app = Flask(__name__)
-cap = None
+cap = cv2.VideoCapture(VIDEO_PATH)
 
 active_bubble = None
+candidate_bubble = None
 bubble_history = []
 next_bubble_id = 1
 bubble_count_total = 0
@@ -134,10 +124,10 @@ HTML_PAGE = """
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('status').textContent =
-                        'Video: ' + data.video +
-                        ' | Debug: ' + (data.debug ? 'ON' : 'OFF') +
+                        'Debug: ' + (data.debug ? 'ON' : 'OFF') +
                         ' | Count: ' + data.count +
                         ' | Active bubble: ' + (data.active_bubble ? 'YES' : 'NO') +
+                        ' | Candidate: ' + (data.candidate_bubble ? 'YES' : 'NO') +
                         ' | Auto center: ' + (data.auto_center ? 'ON' : 'OFF');
                 })
                 .catch(() => {
@@ -161,144 +151,6 @@ HTML_PAGE = """
 </body>
 </html>
 """
-
-SHARED_PROFILE_FIELDS = {
-    "pipe_center_x_bias": "PIPE_CENTER_X_BIAS",
-    "pipe_width_ratio": "PIPE_WIDTH_RATIO",
-    "pipe_lock_width_ratio": "PIPE_LOCK_WIDTH_RATIO",
-    "pipe_top_ratio": "PIPE_TOP_RATIO",
-    "pipe_bottom_ratio": "PIPE_BOTTOM_RATIO",
-    "pipe_exit_ratio": "PIPE_EXIT_RATIO",
-    "count_band_half": "COUNT_BAND_HALF",
-}
-
-TEST_VIDEO_PROFILE_FIELDS = {
-    "target_fps": "TARGET_FPS",
-    "lock_after_frames": "LOCK_AFTER_FRAMES",
-    "lost_after_frames": "LOST_AFTER_FRAMES",
-    "min_travel_y": "MIN_TRAVEL_Y",
-    "detect_every_seconds": "DETECT_EVERY_SECONDS",
-    "min_radius": "MIN_RADIUS",
-    "max_radius": "MAX_RADIUS",
-    "max_match_distance": "MAX_MATCH_DISTANCE",
-    "auto_center_enabled": "AUTO_CENTER_ENABLED",
-    "auto_center_smoothing": "AUTO_CENTER_SMOOTHING",
-    "center_search_width_ratio": "CENTER_SEARCH_WIDTH_RATIO",
-    "auto_center_max_offset_px": "AUTO_CENTER_MAX_OFFSET_PX",
-    "debug_draw": "DEBUG_DRAW",
-}
-
-
-def build_log_path(video_path):
-    return f"bubble_log_{Path(video_path).stem}.jsonl"
-
-
-def build_default_profile_path(video_path):
-    return Path("profiles") / f"{Path(video_path).stem}.json"
-
-
-def validate_video_path(video_path):
-    resolved_path = Path(video_path)
-    if not resolved_path.is_file():
-        raise SystemExit(f"Video file not found: {video_path}")
-    return str(resolved_path)
-
-
-def validate_profile_path(profile_path):
-    resolved_path = Path(profile_path)
-    if not resolved_path.is_file():
-        raise SystemExit(f"Profile file not found: {profile_path}")
-    return str(resolved_path)
-
-
-def resolve_profile_path(video_path, explicit_profile_path=None):
-    if explicit_profile_path is not None:
-        return validate_profile_path(explicit_profile_path)
-
-    default_profile = build_default_profile_path(video_path)
-    if default_profile.is_file():
-        return str(default_profile)
-
-    fallback_profile = Path("profiles") / "Bubbles.json"
-    if fallback_profile.is_file():
-        return str(fallback_profile)
-
-    raise SystemExit(
-        f"No profile found for {video_path}. Expected {default_profile} "
-        "or fallback profiles/Bubbles.json."
-    )
-
-
-def load_profile_data(profile_path):
-    with open(profile_path, "r", encoding="utf-8") as profile_file:
-        data = json.load(profile_file)
-
-    if not isinstance(data, dict):
-        raise SystemExit(f"Profile must be a JSON object: {profile_path}")
-
-    return data
-
-
-def apply_profile_mapping(profile_section, mapping):
-    if not isinstance(profile_section, dict):
-        return
-
-    for key, global_name in mapping.items():
-        if key in profile_section:
-            globals()[global_name] = profile_section[key]
-
-
-def apply_test_video_profile(profile_path):
-    global PROFILE_PATH
-
-    PROFILE_PATH = validate_profile_path(profile_path)
-    profile_data = load_profile_data(PROFILE_PATH)
-
-    apply_profile_mapping(profile_data.get("shared", {}), SHARED_PROFILE_FIELDS)
-    apply_profile_mapping(profile_data.get("test_video", {}), TEST_VIDEO_PROFILE_FIELDS)
-
-
-def load_runtime_dependencies():
-    global cv2, np, detect_bubbles
-
-    import cv2 as cv2_module
-    import numpy as np_module
-    from livestream import (
-        detect_bubbles as detect_bubbles_func,
-        load_runtime_dependencies as load_livestream_runtime_dependencies,
-    )
-
-    load_livestream_runtime_dependencies(require_camera=False)
-
-    cv2 = cv2_module
-    np = np_module
-    detect_bubbles = detect_bubbles_func
-
-
-def configure_video_source(video_path):
-    global VIDEO_PATH, LOG_PATH, cap
-
-    VIDEO_PATH = validate_video_path(video_path)
-    LOG_PATH = build_log_path(VIDEO_PATH)
-
-    if cap is not None:
-        cap.release()
-
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        raise SystemExit(f"Could not open video file: {VIDEO_PATH}")
-
-
-def cleanup_video_source():
-    global cap
-
-    if cap is not None:
-        cap.release()
-        cap = None
-
-
-def current_video_name():
-    return Path(VIDEO_PATH).name
 
 
 def distance(p1, p2):
@@ -348,7 +200,6 @@ def estimate_pipe_center_x(gray_roi, fallback_center_x, previous_center_x=None):
             dx = abs(x2 - x1)
             dy = abs(y2 - y1)
 
-            # Near-vertical lines only
             if dy > 20 and dx <= 12:
                 length = np.hypot(x2 - x1, y2 - y1)
                 center_x = int((x1 + x2) / 2) + x_left
@@ -361,10 +212,6 @@ def estimate_pipe_center_x(gray_roi, fallback_center_x, previous_center_x=None):
     else:
         estimated = fallback_center_x
 
-    min_center_x = fallback_local_x - AUTO_CENTER_MAX_OFFSET_PX
-    max_center_x = fallback_local_x + AUTO_CENTER_MAX_OFFSET_PX
-    estimated = max(min_center_x, min(max_center_x, estimated))
-
     if previous_center_x is None:
         return estimated
 
@@ -375,8 +222,35 @@ def estimate_pipe_center_x(gray_roi, fallback_center_x, previous_center_x=None):
     return smoothed
 
 
+def begin_candidate(cx, cy, r, now):
+    return {
+        "cx": cx,
+        "cy": cy,
+        "r": r,
+        "first_seen": now,
+        "last_seen": now,
+        "seen_frames": 1,
+    }
+
+
+def promote_candidate_to_active(candidate, now, bubble_id):
+    return {
+        "id": bubble_id,
+        "cx": candidate["cx"],
+        "cy": candidate["cy"],
+        "r": candidate["r"],
+        "start_x": candidate["cx"],
+        "start_y": candidate["cy"],
+        "last_seen": now,
+        "seen_frames": candidate["seen_frames"],
+        "lost_frames": 0,
+        "counted": False,
+    }
+
+
 def generate_frames():
     global active_bubble
+    global candidate_bubble
     global bubble_history
     global next_bubble_id
     global bubble_count_total
@@ -393,12 +267,13 @@ def generate_frames():
         ret, frame = cap.read()
         if not ret:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            active_bubble = None
+            candidate_bubble = None
             continue
 
         frame_count += 1
         h, w = frame.shape[:2]
 
-        # Full-frame ROI for testing
         x1, y1, x2, y2 = 0, 0, w, h
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
@@ -465,7 +340,7 @@ def generate_frames():
         detections = []
 
         # ---- DETECT ----
-        if time.time() - last_detect_time > DETECT_EVERY_SECONDS:
+        if frame_count > STARTUP_IGNORE_FRAMES and (time.time() - last_detect_time > DETECT_EVERY_SECONDS):
             detections = detect_bubbles(
                 small_gray=small,
                 scale_x=roi_w / 64,
@@ -487,6 +362,17 @@ def generate_frames():
                 if abs(cx - pipe_center_x) <= pipe_lock_width and pipe_top <= cy <= pipe_bottom
             ]
 
+            # only allow new starts below exit line to avoid random top noise
+            detections = [
+                (cx, cy, r)
+                for (cx, cy, r) in detections
+                if cy >= (pipe_exit_y + MIN_START_BELOW_EXIT)
+            ] + [
+                (cx, cy, r)
+                for (cx, cy, r) in detections
+                if active_bubble is not None
+            ]
+
             detections = sorted(detections, key=lambda d: abs(d[0] - pipe_center_x))
 
         if DEBUG_DRAW:
@@ -495,24 +381,31 @@ def generate_frames():
 
         now = time.time()
 
-        # ---- SINGLE ACTIVE BUBBLE TRACKER ----
+        # ---- CANDIDATE -> ACTIVE ----
         if active_bubble is None:
             if detections:
                 cx, cy, r = detections[0]
-                active_bubble = {
-                    "id": next_bubble_id,
-                    "cx": cx,
-                    "cy": cy,
-                    "r": r,
-                    "start_x": cx,
-                    "start_y": cy,
-                    "last_seen": now,
-                    "seen_frames": 1,
-                    "lost_frames": 0,
-                    "counted": False,
-                }
-                print(f"START bubble {next_bubble_id} at ({cx}, {cy})")
-                next_bubble_id += 1
+
+                if candidate_bubble is None:
+                    candidate_bubble = begin_candidate(cx, cy, r, now)
+                else:
+                    d = distance((cx, cy), (candidate_bubble["cx"], candidate_bubble["cy"]))
+                    if d < CANDIDATE_MATCH_DISTANCE:
+                        candidate_bubble["cx"] = int(0.7 * candidate_bubble["cx"] + 0.3 * cx)
+                        candidate_bubble["cy"] = int(0.7 * candidate_bubble["cy"] + 0.3 * cy)
+                        candidate_bubble["r"] = r
+                        candidate_bubble["last_seen"] = now
+                        candidate_bubble["seen_frames"] += 1
+                    else:
+                        candidate_bubble = begin_candidate(cx, cy, r, now)
+
+                if candidate_bubble["seen_frames"] >= CANDIDATE_CONFIRM_FRAMES:
+                    active_bubble = promote_candidate_to_active(candidate_bubble, now, next_bubble_id)
+                    print(f"START bubble {next_bubble_id} at ({active_bubble['cx']}, {active_bubble['cy']})")
+                    next_bubble_id += 1
+                    candidate_bubble = None
+            else:
+                candidate_bubble = None
         else:
             best_det = None
             best_dist = 999999.0
@@ -592,12 +485,31 @@ def generate_frames():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1
             )
 
+        # ---- DRAW CANDIDATE ----
+        if candidate_bubble is not None and DEBUG_DRAW:
+            cv2.circle(
+                frame,
+                (candidate_bubble["cx"], candidate_bubble["cy"]),
+                int(candidate_bubble["r"]),
+                (255, 165, 0),
+                1
+            )
+            cv2.putText(
+                frame,
+                f"CANDIDATE {candidate_bubble['seen_frames']}",
+                (candidate_bubble["cx"] + 10, candidate_bubble["cy"] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 165, 0),
+                1
+            )
+
         # ---- OVERLAY ----
         fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
 
         overlay = frame.copy()
-        box_width = 330
-        box_height = 160
+        box_width = 290
+        box_height = 155
         ox1 = frame.shape[1] - box_width - 10
         oy1 = 10
         ox2 = frame.shape[1] - 10
@@ -609,10 +521,10 @@ def generate_frames():
         y = oy1 + 22
         line_height = 20
         texts = [
-            f"Video: {current_video_name()}",
             f"FPS: {fps:.1f}",
             f"Frame: {frame_count}",
             f"Bubble: {1 if active_bubble is not None else 0}",
+            f"Candidate: {1 if candidate_bubble is not None else 0}",
             f"Count: {bubble_count_total}",
             f"Fallback bias: {PIPE_CENTER_X_BIAS}",
             f"Auto center: {'ON' if AUTO_CENTER_ENABLED else 'OFF'}",
@@ -663,49 +575,26 @@ def toggle_debug():
 
 @app.route("/reset_counter", methods=["POST"])
 def reset_counter():
-    global bubble_count_total, bubble_history, active_bubble
+    global bubble_count_total, bubble_history, active_bubble, candidate_bubble
     bubble_count_total = 0
     bubble_history = []
     active_bubble = None
+    candidate_bubble = None
     return jsonify({"success": True})
 
 
 @app.route("/status")
 def status():
     return jsonify({
-        "video": current_video_name(),
         "debug": DEBUG_DRAW,
         "count": bubble_count_total,
         "active_bubble": active_bubble is not None,
+        "candidate_bubble": candidate_bubble is not None,
         "auto_center": AUTO_CENTER_ENABLED,
     })
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bubble video stream test harness")
-    parser.add_argument(
-        "--video",
-        default=DEFAULT_VIDEO_PATH,
-        help="Video file to play through the test harness (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--profile",
-        help=(
-            "Profile file to load. Defaults to profiles/<video_stem>.json "
-            "or profiles/Bubbles.json."
-        ),
-    )
-    args = parser.parse_args()
+    app.run(host="0.0.0.0", port=5001, threaded=True) 
 
-    atexit.register(cleanup_video_source)
-
-    validated_video_path = validate_video_path(args.video)
-    resolved_profile_path = resolve_profile_path(
-        validated_video_path,
-        explicit_profile_path=args.profile,
-    )
-    apply_test_video_profile(resolved_profile_path)
-    load_runtime_dependencies()
-    configure_video_source(validated_video_path)
-
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+ 
