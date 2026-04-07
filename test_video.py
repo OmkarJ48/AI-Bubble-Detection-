@@ -1,75 +1,58 @@
 import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-import argparse
-import atexit
 import json
 import time
-from pathlib import Path
-
+import cv2
+import numpy as np
 from flask import Flask, Response, jsonify, render_template_string
 
-cv2 = None
-np = None
-detect_bubbles = None
-build_pipe_geometry = None
-filter_tracker_detections = None
-update_single_bubble_tracker = None
+from livestream import detect_bubbles
 
-DEFAULT_VIDEO_PATH = "Bubbles.mp4"
-VIDEO_PATH = DEFAULT_VIDEO_PATH
-LOG_PATH = "bubble_log_Bubbles.jsonl"
-PROFILE_PATH = None
+VIDEO_PATH = "Bubbles2.mp4"
+LOG_PATH = "bubble_log.jsonl"
 
 TARGET_FPS = 20
 LOCK_AFTER_FRAMES = 2
 LOST_AFTER_FRAMES = 3
-MIN_UPWARD_TRAVEL = 18
+MIN_TRAVEL_Y = 18
 
 # ---- PIPE TUNING ----
-# Verified manual fallback
 PIPE_CENTER_X_BIAS = -50
 
-# Width / lock zone ratios
 PIPE_WIDTH_RATIO = 0.35
 PIPE_LOCK_WIDTH_RATIO = 0.18
 
-# Vertical pipe region
 PIPE_TOP_RATIO = 0.25
 PIPE_BOTTOM_RATIO = 0.75
 PIPE_EXIT_RATIO = 0.55
 
-# Count band thickness
 COUNT_BAND_HALF = 12
 
-# Detection timing
 DETECT_EVERY_SECONDS = 0.10
 
-# Bubble size filter
 MIN_RADIUS = 10
 MAX_RADIUS = 20
-
-# Match distance
 MAX_MATCH_DISTANCE = 60
-DOWNWARD_TOLERANCE = 10
 
-# Acquisition band
-SPAWN_BAND_HALF = 22
-
-# Auto center calibration
 AUTO_CENTER_ENABLED = True
-AUTO_CENTER_SMOOTHING = 0.80   # higher = more stable, less reactive
+AUTO_CENTER_SMOOTHING = 0.80
 CENTER_SEARCH_WIDTH_RATIO = 0.35
-AUTO_CENTER_MAX_OFFSET_PX = 120
 
-# Debug overlay
 DEBUG_DRAW = True
+
+# ---- NOISE / FALSE-START CONTROL ----
+STARTUP_IGNORE_FRAMES = 8
+CANDIDATE_CONFIRM_FRAMES = 2
+CANDIDATE_MATCH_DISTANCE = 50
+MIN_START_BELOW_EXIT = 18   # new bubble must start this many px below exit line
 
 
 app = Flask(__name__)
-cap = None
+cap = cv2.VideoCapture(VIDEO_PATH)
 
 active_bubble = None
+candidate_bubble = None
 bubble_history = []
 next_bubble_id = 1
 bubble_count_total = 0
@@ -141,10 +124,10 @@ HTML_PAGE = """
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('status').textContent =
-                        'Video: ' + data.video +
-                        ' | Debug: ' + (data.debug ? 'ON' : 'OFF') +
+                        'Debug: ' + (data.debug ? 'ON' : 'OFF') +
                         ' | Count: ' + data.count +
                         ' | Active bubble: ' + (data.active_bubble ? 'YES' : 'NO') +
+                        ' | Candidate: ' + (data.candidate_bubble ? 'YES' : 'NO') +
                         ' | Auto center: ' + (data.auto_center ? 'ON' : 'OFF');
                 })
                 .catch(() => {
@@ -169,155 +152,6 @@ HTML_PAGE = """
 </html>
 """
 
-SHARED_PROFILE_FIELDS = {
-    "pipe_center_x_bias": "PIPE_CENTER_X_BIAS",
-    "pipe_width_ratio": "PIPE_WIDTH_RATIO",
-    "pipe_lock_width_ratio": "PIPE_LOCK_WIDTH_RATIO",
-    "pipe_top_ratio": "PIPE_TOP_RATIO",
-    "pipe_bottom_ratio": "PIPE_BOTTOM_RATIO",
-    "pipe_exit_ratio": "PIPE_EXIT_RATIO",
-    "count_band_half": "COUNT_BAND_HALF",
-}
-
-TEST_VIDEO_PROFILE_FIELDS = {
-    "target_fps": "TARGET_FPS",
-    "lock_after_frames": "LOCK_AFTER_FRAMES",
-    "lost_after_frames": "LOST_AFTER_FRAMES",
-    "min_travel_y": "MIN_UPWARD_TRAVEL",
-    "min_upward_travel": "MIN_UPWARD_TRAVEL",
-    "detect_every_seconds": "DETECT_EVERY_SECONDS",
-    "min_radius": "MIN_RADIUS",
-    "max_radius": "MAX_RADIUS",
-    "max_match_distance": "MAX_MATCH_DISTANCE",
-    "downward_tolerance": "DOWNWARD_TOLERANCE",
-    "spawn_band_half": "SPAWN_BAND_HALF",
-    "auto_center_enabled": "AUTO_CENTER_ENABLED",
-    "auto_center_smoothing": "AUTO_CENTER_SMOOTHING",
-    "center_search_width_ratio": "CENTER_SEARCH_WIDTH_RATIO",
-    "auto_center_max_offset_px": "AUTO_CENTER_MAX_OFFSET_PX",
-    "debug_draw": "DEBUG_DRAW",
-}
-
-
-def build_log_path(video_path):
-    return f"bubble_log_{Path(video_path).stem}.jsonl"
-
-
-def build_default_profile_path(video_path):
-    return Path("profiles") / f"{Path(video_path).stem}.json"
-
-
-def validate_video_path(video_path):
-    resolved_path = Path(video_path)
-    if not resolved_path.is_file():
-        raise SystemExit(f"Video file not found: {video_path}")
-    return str(resolved_path)
-
-
-def validate_profile_path(profile_path):
-    resolved_path = Path(profile_path)
-    if not resolved_path.is_file():
-        raise SystemExit(f"Profile file not found: {profile_path}")
-    return str(resolved_path)
-
-
-def resolve_profile_path(video_path, explicit_profile_path=None):
-    if explicit_profile_path is not None:
-        return validate_profile_path(explicit_profile_path)
-
-    default_profile = build_default_profile_path(video_path)
-    if default_profile.is_file():
-        return str(default_profile)
-
-    fallback_profile = Path("profiles") / "Bubbles.json"
-    if fallback_profile.is_file():
-        return str(fallback_profile)
-
-    raise SystemExit(
-        f"No profile found for {video_path}. Expected {default_profile} "
-        "or fallback profiles/Bubbles.json."
-    )
-
-
-def load_profile_data(profile_path):
-    with open(profile_path, "r", encoding="utf-8") as profile_file:
-        data = json.load(profile_file)
-
-    if not isinstance(data, dict):
-        raise SystemExit(f"Profile must be a JSON object: {profile_path}")
-
-    return data
-
-
-def apply_profile_mapping(profile_section, mapping):
-    if not isinstance(profile_section, dict):
-        return
-
-    for key, global_name in mapping.items():
-        if key in profile_section:
-            globals()[global_name] = profile_section[key]
-
-
-def apply_test_video_profile(profile_path):
-    global PROFILE_PATH
-
-    PROFILE_PATH = validate_profile_path(profile_path)
-    profile_data = load_profile_data(PROFILE_PATH)
-
-    apply_profile_mapping(profile_data.get("shared", {}), SHARED_PROFILE_FIELDS)
-    apply_profile_mapping(profile_data.get("test_video", {}), TEST_VIDEO_PROFILE_FIELDS)
-
-
-def load_runtime_dependencies():
-    global cv2, np, detect_bubbles
-    global build_pipe_geometry, filter_tracker_detections, update_single_bubble_tracker
-
-    import cv2 as cv2_module
-    import numpy as np_module
-    from livestream import (
-        build_pipe_geometry as build_pipe_geometry_func,
-        detect_bubbles as detect_bubbles_func,
-        filter_tracker_detections as filter_tracker_detections_func,
-        load_runtime_dependencies as load_livestream_runtime_dependencies,
-        update_single_bubble_tracker as update_single_bubble_tracker_func,
-    )
-
-    load_livestream_runtime_dependencies(require_camera=False)
-
-    cv2 = cv2_module
-    np = np_module
-    build_pipe_geometry = build_pipe_geometry_func
-    detect_bubbles = detect_bubbles_func
-    filter_tracker_detections = filter_tracker_detections_func
-    update_single_bubble_tracker = update_single_bubble_tracker_func
-
-
-def configure_video_source(video_path):
-    global VIDEO_PATH, LOG_PATH, cap
-
-    VIDEO_PATH = validate_video_path(video_path)
-    LOG_PATH = build_log_path(VIDEO_PATH)
-    reset_tracker_runtime_state(reset_counts=True)
-
-    if cap is not None:
-        cap.release()
-
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        raise SystemExit(f"Could not open video file: {VIDEO_PATH}")
-
-
-def cleanup_video_source():
-    global cap
-
-    if cap is not None:
-        cap.release()
-        cap = None
-
-
-def current_video_name():
-    return Path(VIDEO_PATH).name
-
 
 def distance(p1, p2):
     return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
@@ -331,26 +165,92 @@ def log_bubble_event(entry):
         print("Failed to write log:", e)
 
 
-def reset_tracker_runtime_state(reset_counts=False):
-    global active_bubble
-    global bubble_history
-    global next_bubble_id
-    global bubble_count_total
-    global last_detect_time
-    global dynamic_pipe_center_x
+def estimate_pipe_center_x(gray_roi, fallback_center_x, previous_center_x=None):
+    """
+    Estimate pipe center from near-vertical edges in the middle region.
+    Falls back to manual bias if no stable line is found.
+    """
+    roi_h, roi_w = gray_roi.shape[:2]
 
-    active_bubble = None
-    last_detect_time = 0.0
-    dynamic_pipe_center_x = None
+    search_half_width = int(roi_w * CENTER_SEARCH_WIDTH_RATIO / 2)
+    fallback_local_x = fallback_center_x
+    x_left = max(0, fallback_local_x - search_half_width)
+    x_right = min(roi_w, fallback_local_x + search_half_width)
 
-    if reset_counts:
-        bubble_history = []
-        next_bubble_id = 1
-        bubble_count_total = 0
+    search = gray_roi[:, x_left:x_right]
+    if search.size == 0:
+        return fallback_center_x
+
+    edges = cv2.Canny(search, 50, 150)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=40,
+        minLineLength=max(20, int(roi_h * 0.25)),
+        maxLineGap=15
+    )
+
+    candidate_xs = []
+
+    if lines is not None:
+        for line in lines[:, 0]:
+            x1, y1, x2, y2 = line
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+
+            if dy > 20 and dx <= 12:
+                length = np.hypot(x2 - x1, y2 - y1)
+                center_x = int((x1 + x2) / 2) + x_left
+                candidate_xs.append((length, center_x))
+
+    if candidate_xs:
+        candidate_xs.sort(reverse=True, key=lambda item: item[0])
+        best = candidate_xs[:2]
+        estimated = int(np.mean([x for _, x in best]))
+    else:
+        estimated = fallback_center_x
+
+    if previous_center_x is None:
+        return estimated
+
+    smoothed = int(
+        AUTO_CENTER_SMOOTHING * previous_center_x +
+        (1.0 - AUTO_CENTER_SMOOTHING) * estimated
+    )
+    return smoothed
+
+
+def begin_candidate(cx, cy, r, now):
+    return {
+        "cx": cx,
+        "cy": cy,
+        "r": r,
+        "first_seen": now,
+        "last_seen": now,
+        "seen_frames": 1,
+    }
+
+
+def promote_candidate_to_active(candidate, now, bubble_id):
+    return {
+        "id": bubble_id,
+        "cx": candidate["cx"],
+        "cy": candidate["cy"],
+        "r": candidate["r"],
+        "start_x": candidate["cx"],
+        "start_y": candidate["cy"],
+        "last_seen": now,
+        "seen_frames": candidate["seen_frames"],
+        "lost_frames": 0,
+        "counted": False,
+    }
 
 
 def generate_frames():
     global active_bubble
+    global candidate_bubble
     global bubble_history
     global next_bubble_id
     global bubble_count_total
@@ -366,14 +266,14 @@ def generate_frames():
 
         ret, frame = cap.read()
         if not ret:
-            reset_tracker_runtime_state(reset_counts=False)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            active_bubble = None
+            candidate_bubble = None
             continue
 
         frame_count += 1
         h, w = frame.shape[:2]
 
-        # Full-frame ROI for testing
         x1, y1, x2, y2 = 0, 0, w, h
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
@@ -387,82 +287,61 @@ def generate_frames():
         small = cv2.resize(blur, (64, 48), interpolation=cv2.INTER_AREA)
         small = cv2.equalizeHist(small)
 
-        geometry = build_pipe_geometry(
-            gray_roi=gray,
-            x_offset=x_offset,
-            y_offset=y_offset,
-            auto_center_enabled=AUTO_CENTER_ENABLED,
-            previous_center_x=dynamic_pipe_center_x,
-            pipe_center_x_bias=PIPE_CENTER_X_BIAS,
-            pipe_width_ratio=PIPE_WIDTH_RATIO,
-            pipe_lock_width_ratio=PIPE_LOCK_WIDTH_RATIO,
-            pipe_top_ratio=PIPE_TOP_RATIO,
-            pipe_bottom_ratio=PIPE_BOTTOM_RATIO,
-            pipe_exit_ratio=PIPE_EXIT_RATIO,
-            center_search_width_ratio=CENTER_SEARCH_WIDTH_RATIO,
-            auto_center_smoothing=AUTO_CENTER_SMOOTHING,
-            auto_center_max_offset_px=AUTO_CENTER_MAX_OFFSET_PX,
-            spawn_band_half=SPAWN_BAND_HALF,
-            count_band_half=COUNT_BAND_HALF,
-            count_band_y_bias=-30,
-        )
-        dynamic_pipe_center_x = geometry["pipe_center_local_x"]
+        # ---- PIPE GEOMETRY ----
+        fallback_pipe_center_x = (roi_w // 2) + PIPE_CENTER_X_BIAS
+
+        if AUTO_CENTER_ENABLED:
+            estimated_local_center_x = estimate_pipe_center_x(
+                gray_roi=gray,
+                fallback_center_x=fallback_pipe_center_x,
+                previous_center_x=dynamic_pipe_center_x
+            )
+            dynamic_pipe_center_x = estimated_local_center_x
+            pipe_center_x = x_offset + dynamic_pipe_center_x
+        else:
+            pipe_center_x = x_offset + fallback_pipe_center_x
+
+        pipe_width = int(roi_w * PIPE_WIDTH_RATIO)
+        pipe_lock_width = int(roi_w * PIPE_LOCK_WIDTH_RATIO)
+
+        pipe_top = y_offset + int(roi_h * PIPE_TOP_RATIO)
+        pipe_bottom = y_offset + int(roi_h * PIPE_BOTTOM_RATIO)
+        pipe_exit_y = y_offset + int(roi_h * PIPE_EXIT_RATIO)
+
+        count_y1 = pipe_exit_y - COUNT_BAND_HALF
+        count_y2 = pipe_exit_y + COUNT_BAND_HALF
 
         # ---- DRAW GUIDES ----
         if DEBUG_DRAW:
-            cv2.line(
-                frame,
-                (geometry["pipe_center_x"], y1),
-                (geometry["pipe_center_x"], y2),
-                (255, 255, 0),
-                2,
-            )
+            cv2.line(frame, (pipe_center_x, y1), (pipe_center_x, y2), (255, 255, 0), 2)
 
             cv2.rectangle(
                 frame,
-                (geometry["pipe_center_x"] - geometry["pipe_width"], geometry["pipe_top"]),
-                (geometry["pipe_center_x"] + geometry["pipe_width"], geometry["pipe_bottom"]),
+                (pipe_center_x - pipe_width, pipe_top),
+                (pipe_center_x + pipe_width, pipe_bottom),
                 (255, 0, 255), 2
             )
 
             cv2.rectangle(
                 frame,
-                (geometry["pipe_center_x"] - geometry["pipe_lock_width"], geometry["pipe_top"]),
-                (geometry["pipe_center_x"] + geometry["pipe_lock_width"], geometry["pipe_bottom"]),
+                (pipe_center_x - pipe_lock_width, pipe_top),
+                (pipe_center_x + pipe_lock_width, pipe_bottom),
                 (0, 255, 255), 1
             )
 
-            cv2.rectangle(
-                frame,
-                (x1, geometry["spawn_y1"]),
-                (x2, geometry["spawn_y2"]),
-                (0, 165, 255),
-                1,
-            )
-            cv2.putText(
-                frame, "SPAWN BAND", (x1 + 10, geometry["spawn_y1"] - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1
-            )
-
-            cv2.rectangle(
-                frame,
-                (x1, geometry["count_y1"]),
-                (x2, geometry["count_y2"]),
-                (0, 100, 255),
-                1,
-            )
+            cv2.line(frame, (x1, pipe_exit_y), (x2, pipe_exit_y), (0, 0, 255), 2)
+            cv2.rectangle(frame, (x1, count_y1), (x2, count_y2), (0, 100, 255), 1)
 
             cv2.putText(
-                frame, "UPWARD CHECK", (x1 + 10, geometry["count_y1"] - 5),
+                frame, "COUNT BAND", (x1 + 10, count_y1 - 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1
             )
 
         detections = []
-        raw_detections = []
 
         # ---- DETECT ----
-        if time.time() - last_detect_time > DETECT_EVERY_SECONDS:
-            raw_detections = detect_bubbles(
+        if frame_count > STARTUP_IGNORE_FRAMES and (time.time() - last_detect_time > DETECT_EVERY_SECONDS):
+            detections = detect_bubbles(
                 small_gray=small,
                 scale_x=roi_w / 64,
                 scale_y=roi_h / 48,
@@ -471,15 +350,30 @@ def generate_frames():
             )
             last_detect_time = time.time()
 
-            detections = filter_tracker_detections(
-                raw_detections=raw_detections,
-                geometry=geometry,
-                active_bubble=active_bubble,
-                min_radius=MIN_RADIUS,
-                max_radius=MAX_RADIUS,
-                max_match_distance=MAX_MATCH_DISTANCE,
-                downward_tolerance=DOWNWARD_TOLERANCE,
-            )
+            detections = [
+                (cx, cy, r)
+                for (cx, cy, r) in detections
+                if MIN_RADIUS < r < MAX_RADIUS
+            ]
+
+            detections = [
+                (cx, cy, r)
+                for (cx, cy, r) in detections
+                if abs(cx - pipe_center_x) <= pipe_lock_width and pipe_top <= cy <= pipe_bottom
+            ]
+
+            # only allow new starts below exit line to avoid random top noise
+            detections = [
+                (cx, cy, r)
+                for (cx, cy, r) in detections
+                if cy >= (pipe_exit_y + MIN_START_BELOW_EXIT)
+            ] + [
+                (cx, cy, r)
+                for (cx, cy, r) in detections
+                if active_bubble is not None
+            ]
+
+            detections = sorted(detections, key=lambda d: abs(d[0] - pipe_center_x))
 
         if DEBUG_DRAW:
             for (cx, cy, r) in detections:
@@ -487,37 +381,89 @@ def generate_frames():
 
         now = time.time()
 
-        previous_active_id = active_bubble["id"] if active_bubble is not None else None
-        active_bubble, next_bubble_id, ended_entry, count_increment = update_single_bubble_tracker(
-            active_bubble=active_bubble,
-            detections=detections,
-            now=now,
-            next_bubble_id=next_bubble_id,
-            lock_after_frames=LOCK_AFTER_FRAMES,
-            lost_after_frames=LOST_AFTER_FRAMES,
-            min_upward_travel=MIN_UPWARD_TRAVEL,
-            max_match_distance=MAX_MATCH_DISTANCE,
-            downward_tolerance=DOWNWARD_TOLERANCE,
-        )
+        # ---- CANDIDATE -> ACTIVE ----
+        if active_bubble is None:
+            if detections:
+                cx, cy, r = detections[0]
 
-        if previous_active_id is None and active_bubble is not None:
-            print(f"START bubble {active_bubble['id']} at ({active_bubble['cx']}, {active_bubble['cy']})")
+                if candidate_bubble is None:
+                    candidate_bubble = begin_candidate(cx, cy, r, now)
+                else:
+                    d = distance((cx, cy), (candidate_bubble["cx"], candidate_bubble["cy"]))
+                    if d < CANDIDATE_MATCH_DISTANCE:
+                        candidate_bubble["cx"] = int(0.7 * candidate_bubble["cx"] + 0.3 * cx)
+                        candidate_bubble["cy"] = int(0.7 * candidate_bubble["cy"] + 0.3 * cy)
+                        candidate_bubble["r"] = r
+                        candidate_bubble["last_seen"] = now
+                        candidate_bubble["seen_frames"] += 1
+                    else:
+                        candidate_bubble = begin_candidate(cx, cy, r, now)
 
-        if ended_entry is not None:
+                if candidate_bubble["seen_frames"] >= CANDIDATE_CONFIRM_FRAMES:
+                    active_bubble = promote_candidate_to_active(candidate_bubble, now, next_bubble_id)
+                    print(f"START bubble {next_bubble_id} at ({active_bubble['cx']}, {active_bubble['cy']})")
+                    next_bubble_id += 1
+                    candidate_bubble = None
+            else:
+                candidate_bubble = None
+        else:
+            best_det = None
+            best_dist = 999999.0
+
+            for det in detections:
+                cx, cy, r = det
+                d = distance((cx, cy), (active_bubble["cx"], active_bubble["cy"]))
+                if d < best_dist:
+                    best_dist = d
+                    best_det = det
+
+            if best_det is not None and best_dist < MAX_MATCH_DISTANCE:
+                cx, cy, r = best_det
+                active_bubble["cx"] = int(0.7 * active_bubble["cx"] + 0.3 * cx)
+                active_bubble["cy"] = int(0.7 * active_bubble["cy"] + 0.3 * cy)
+                active_bubble["r"] = r
+                active_bubble["last_seen"] = now
+                active_bubble["seen_frames"] += 1
+                active_bubble["lost_frames"] = 0
+            else:
+                active_bubble["lost_frames"] += 1
+
+        # ---- COUNT ONCE ----
+        if active_bubble is not None:
+            bubble_id = active_bubble["id"]
+            cx = active_bubble["cx"]
+            cy = active_bubble["cy"]
+
+            travel_y = abs(cy - active_bubble["start_y"])
+
+            if (
+                not active_bubble["counted"]
+                and active_bubble["seen_frames"] >= LOCK_AFTER_FRAMES
+                and travel_y >= MIN_TRAVEL_Y
+                and count_y1 <= cy <= count_y2
+            ):
+                bubble_count_total += 1
+                active_bubble["counted"] = True
+                print(f"COUNTED bubble {bubble_id} total={bubble_count_total}")
+
+        # ---- END LOST BUBBLE ----
+        if active_bubble is not None and active_bubble["lost_frames"] >= LOST_AFTER_FRAMES:
+            ended_entry = {
+                "id": active_bubble["id"],
+                "counted": active_bubble["counted"],
+                "start_x": active_bubble["start_x"],
+                "start_y": active_bubble["start_y"],
+                "end_x": active_bubble["cx"],
+                "end_y": active_bubble["cy"],
+                "seen_frames": active_bubble["seen_frames"],
+                "ended_at": now,
+            }
+
             bubble_history.append(ended_entry)
             log_bubble_event(ended_entry)
 
-            if count_increment:
-                bubble_count_total += count_increment
-                print(f"COUNTED bubble {ended_entry['id']} total={bubble_count_total}")
-            else:
-                print(
-                    f"DROPPED bubble {ended_entry['id']} "
-                    f"seen_frames={ended_entry['seen_frames']} "
-                    f"traveled_up={ended_entry['traveled_up']}"
-                )
-
-            print(f"ENDED bubble {ended_entry['id']} counted={ended_entry['counted']}")
+            print(f"ENDED bubble {active_bubble['id']} counted={active_bubble['counted']}")
+            active_bubble = None
 
         # ---- DRAW ACTIVE BUBBLE ----
         if active_bubble is not None:
@@ -526,24 +472,44 @@ def generate_frames():
             r = active_bubble["r"]
             bid = active_bubble["id"]
 
-            color = (0, 255, 0)
+            color = (0, 255, 0) if active_bubble["counted"] else (0, 255, 255)
 
             cv2.circle(frame, (cx, cy), int(r), color, 2)
             cv2.circle(frame, (cx, cy), 3, color, -1)
 
-            label = f"ID {bid} TRACKING"
+            label = f"ID {bid}"
+            label += " COUNTED" if active_bubble["counted"] else " TRACKING"
 
             cv2.putText(
                 frame, label, (cx + 10, cy),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1
             )
 
+        # ---- DRAW CANDIDATE ----
+        if candidate_bubble is not None and DEBUG_DRAW:
+            cv2.circle(
+                frame,
+                (candidate_bubble["cx"], candidate_bubble["cy"]),
+                int(candidate_bubble["r"]),
+                (255, 165, 0),
+                1
+            )
+            cv2.putText(
+                frame,
+                f"CANDIDATE {candidate_bubble['seen_frames']}",
+                (candidate_bubble["cx"] + 10, candidate_bubble["cy"] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 165, 0),
+                1
+            )
+
         # ---- OVERLAY ----
         fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
 
         overlay = frame.copy()
-        box_width = 330
-        box_height = 160
+        box_width = 290
+        box_height = 155
         ox1 = frame.shape[1] - box_width - 10
         oy1 = 10
         ox2 = frame.shape[1] - 10
@@ -555,10 +521,10 @@ def generate_frames():
         y = oy1 + 22
         line_height = 20
         texts = [
-            f"Video: {current_video_name()}",
             f"FPS: {fps:.1f}",
             f"Frame: {frame_count}",
             f"Bubble: {1 if active_bubble is not None else 0}",
+            f"Candidate: {1 if candidate_bubble is not None else 0}",
             f"Count: {bubble_count_total}",
             f"Fallback bias: {PIPE_CENTER_X_BIAS}",
             f"Auto center: {'ON' if AUTO_CENTER_ENABLED else 'OFF'}",
@@ -609,46 +575,26 @@ def toggle_debug():
 
 @app.route("/reset_counter", methods=["POST"])
 def reset_counter():
-    reset_tracker_runtime_state(reset_counts=True)
+    global bubble_count_total, bubble_history, active_bubble, candidate_bubble
+    bubble_count_total = 0
+    bubble_history = []
+    active_bubble = None
+    candidate_bubble = None
     return jsonify({"success": True})
 
 
 @app.route("/status")
 def status():
     return jsonify({
-        "video": current_video_name(),
         "debug": DEBUG_DRAW,
         "count": bubble_count_total,
         "active_bubble": active_bubble is not None,
+        "candidate_bubble": candidate_bubble is not None,
         "auto_center": AUTO_CENTER_ENABLED,
     })
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bubble video stream test harness")
-    parser.add_argument(
-        "--video",
-        default=DEFAULT_VIDEO_PATH,
-        help="Video file to play through the test harness (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--profile",
-        help=(
-            "Profile file to load. Defaults to profiles/<video_stem>.json "
-            "or profiles/Bubbles.json."
-        ),
-    )
-    args = parser.parse_args()
+    app.run(host="0.0.0.0", port=5001, threaded=True) 
 
-    atexit.register(cleanup_video_source)
-
-    validated_video_path = validate_video_path(args.video)
-    resolved_profile_path = resolve_profile_path(
-        validated_video_path,
-        explicit_profile_path=args.profile,
-    )
-    apply_test_video_profile(resolved_profile_path)
-    load_runtime_dependencies()
-    configure_video_source(validated_video_path)
-
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+ 
