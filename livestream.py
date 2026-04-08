@@ -25,7 +25,7 @@ output = None
 camera = None
 streaming = False
 recording = False
-recording_output = None
+recording_output = None 
 
 active_bubble = None
 bubble_history = []

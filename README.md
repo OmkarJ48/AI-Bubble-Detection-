@@ -2,7 +2,7 @@
 
 This document tracks the current working tree in this folder as of 2026-04-02. It is focused on the newer bubble-detection workflow built around:
 
-- `livestream.py` for the Raspberry Pi live camera stream
+- `livestream.py` for the Raspberry Pi live camera stream 
 - `test_video.py` for offline validation against `Bubbles.mp4`
 
 The current code no longer matches the older README draft that described generic ROI tracking, motion detection, and recording controls. The sections below follow the behavior that is actually present in the code today.
