@@ -10,6 +10,7 @@ DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 DEFAULT_FPS = 30
 DEFAULT_CRF = 20
+DEFAULT_DATASET_DIR = "Prototype Dataset 1"
 
 
 def build_output_path(input_path: Path) -> Path:
@@ -57,14 +58,45 @@ def normalize_video(input_path: Path, force: bool) -> Path:
     return output_path
 
 
+def resolve_inputs(inputs: list[str], dataset_dir: str | None) -> list[Path]:
+    resolved_inputs = [Path(raw_input) for raw_input in inputs]
+
+    if dataset_dir is not None:
+        dataset_path = Path(dataset_dir)
+        if not dataset_path.is_dir():
+            raise SystemExit(f"Dataset directory not found: {dataset_dir}")
+        resolved_inputs.extend(sorted(dataset_path.glob("*.MOV")))
+
+    unique_inputs = []
+    seen = set()
+    for path in resolved_inputs:
+        normalized = str(path)
+        if normalized not in seen:
+            unique_inputs.append(path)
+            seen.add(normalized)
+
+    if not unique_inputs:
+        raise SystemExit("No input videos provided")
+
+    return unique_inputs
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate normalized MP4 proxy videos for bubble tuning"
     )
     parser.add_argument(
         "inputs",
-        nargs="+",
+        nargs="*",
         help="Input video files to normalize, typically .MOV bubble captures",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        default=None,
+        help=(
+            "Normalize every .MOV file in a dataset directory. "
+            f"Example: --dataset-dir \"{DEFAULT_DATASET_DIR}\""
+        ),
     )
     parser.add_argument(
         "--force",
@@ -75,10 +107,9 @@ def main() -> int:
 
     ensure_ffmpeg_available()
 
-    for raw_input in args.inputs:
-        input_path = Path(raw_input)
+    for input_path in resolve_inputs(args.inputs, args.dataset_dir):
         output_path = normalize_video(input_path, force=args.force)
-        print(f"{input_path.name} -> {output_path.name}")
+        print(f"{input_path} -> {output_path}")
 
     return 0
 

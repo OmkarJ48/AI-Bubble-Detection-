@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi 5 Camera Livestream Server.
+Raspberry Pi 5 camera livestream with shared precision-first bubble tracking.
 
-Precision-first, single-track behavior:
 - one candidate max, one active bubble max
-- strict pipe-lock + spawn-band start gating
-- direction-aware matching to avoid jitter jumps
-- count only after lock + upward travel + count-band hit + disappearance
+- strict pipe-mouth start gating
+- profile-driven calibration shared with offline dataset tuning
+- count only bubbles emerging from the pipe and moving upward
 """
 
 import io
@@ -24,14 +23,12 @@ from bubble_tracker import (
     TrackerConfig,
     apply_profile_mapping,
     detect_bubbles,
+    empty_detection_snapshot,
     estimate_pipe_center_x,
     load_profile_data,
     resolve_profile_path,
 )
 
-# =========================
-# GLOBAL STATE / TUNING
-# =========================
 output = None
 camera = None
 streaming = False
@@ -40,15 +37,7 @@ recording_output = None
 Picamera2 = None
 
 tracker = PrecisionBubbleTracker(TrackerConfig())
-last_detection_snapshot = {
-    "raw_detections": [],
-    "filtered_detections": [],
-    "start_candidates": [],
-    "state": "idle",
-    "started_id": None,
-    "counted": False,
-    "ended_event": None,
-}
+last_detection_snapshot = empty_detection_snapshot()
 
 TARGET_FPS = 20
 
@@ -62,6 +51,7 @@ ROI_Y2 = 500
 PIPE_CENTER_X_BIAS = -50
 PIPE_WIDTH_RATIO = 0.35
 PIPE_LOCK_WIDTH_RATIO = 0.18
+PIPE_MOUTH_LOCK_WIDTH_RATIO = 0.08
 PIPE_TOP_RATIO = 0.25
 PIPE_BOTTOM_RATIO = 0.75
 PIPE_EXIT_RATIO = 0.55
@@ -83,30 +73,69 @@ MAX_RADIUS = 20
 # Acquisition / band logic
 SPAWN_BAND_HALF = 22
 MIN_START_BELOW_EXIT = 18
+MIN_CANDIDATE_UPWARD_TRAVEL = 6
 CANDIDATE_CONFIRM_FRAMES = 2
 CANDIDATE_MATCH_DISTANCE = 50
 CANDIDATE_LOST_AFTER_FRAMES = 1
 COUNT_BAND_HALF = 12
 COUNT_BAND_OFFSET = -30
 
-# Auto-center (optional, profile-driven)
-AUTO_CENTER_ENABLED = False
+# Auto-center
+AUTO_CENTER_ENABLED = True
 AUTO_CENTER_SMOOTHING = 0.85
 CENTER_SEARCH_WIDTH_RATIO = 0.35
 AUTO_CENTER_MAX_OFFSET_PX = 120
 
-# Debug
 DEBUG_DRAW = True
 
 PROFILE_PATH = None
 STREAM_NAME = "livestream"
 dynamic_pipe_center_x = None
 
+DEFAULT_TUNING_VALUES = {
+    "TARGET_FPS": TARGET_FPS,
+    "ROI_X1": ROI_X1,
+    "ROI_Y1": ROI_Y1,
+    "ROI_X2": ROI_X2,
+    "ROI_Y2": ROI_Y2,
+    "PIPE_CENTER_X_BIAS": PIPE_CENTER_X_BIAS,
+    "PIPE_WIDTH_RATIO": PIPE_WIDTH_RATIO,
+    "PIPE_LOCK_WIDTH_RATIO": PIPE_LOCK_WIDTH_RATIO,
+    "PIPE_MOUTH_LOCK_WIDTH_RATIO": PIPE_MOUTH_LOCK_WIDTH_RATIO,
+    "PIPE_TOP_RATIO": PIPE_TOP_RATIO,
+    "PIPE_BOTTOM_RATIO": PIPE_BOTTOM_RATIO,
+    "PIPE_EXIT_RATIO": PIPE_EXIT_RATIO,
+    "LOCK_AFTER_FRAMES": LOCK_AFTER_FRAMES,
+    "LOST_AFTER_FRAMES": LOST_AFTER_FRAMES,
+    "MIN_UPWARD_TRAVEL": MIN_UPWARD_TRAVEL,
+    "MAX_MATCH_DISTANCE": MAX_MATCH_DISTANCE,
+    "DOWNWARD_TOLERANCE": DOWNWARD_TOLERANCE,
+    "MAX_LATERAL_SHIFT": MAX_LATERAL_SHIFT,
+    "MAX_STEP_DISTANCE": MAX_STEP_DISTANCE,
+    "DETECT_INTERVAL": DETECT_INTERVAL,
+    "MIN_RADIUS": MIN_RADIUS,
+    "MAX_RADIUS": MAX_RADIUS,
+    "SPAWN_BAND_HALF": SPAWN_BAND_HALF,
+    "MIN_START_BELOW_EXIT": MIN_START_BELOW_EXIT,
+    "MIN_CANDIDATE_UPWARD_TRAVEL": MIN_CANDIDATE_UPWARD_TRAVEL,
+    "CANDIDATE_CONFIRM_FRAMES": CANDIDATE_CONFIRM_FRAMES,
+    "CANDIDATE_MATCH_DISTANCE": CANDIDATE_MATCH_DISTANCE,
+    "CANDIDATE_LOST_AFTER_FRAMES": CANDIDATE_LOST_AFTER_FRAMES,
+    "COUNT_BAND_HALF": COUNT_BAND_HALF,
+    "COUNT_BAND_OFFSET": COUNT_BAND_OFFSET,
+    "AUTO_CENTER_ENABLED": AUTO_CENTER_ENABLED,
+    "AUTO_CENTER_SMOOTHING": AUTO_CENTER_SMOOTHING,
+    "CENTER_SEARCH_WIDTH_RATIO": CENTER_SEARCH_WIDTH_RATIO,
+    "AUTO_CENTER_MAX_OFFSET_PX": AUTO_CENTER_MAX_OFFSET_PX,
+    "DEBUG_DRAW": DEBUG_DRAW,
+}
+
 
 SHARED_PROFILE_FIELDS = {
     "pipe_center_x_bias": "PIPE_CENTER_X_BIAS",
     "pipe_width_ratio": "PIPE_WIDTH_RATIO",
     "pipe_lock_width_ratio": "PIPE_LOCK_WIDTH_RATIO",
+    "pipe_mouth_lock_width_ratio": "PIPE_MOUTH_LOCK_WIDTH_RATIO",
     "pipe_top_ratio": "PIPE_TOP_RATIO",
     "pipe_bottom_ratio": "PIPE_BOTTOM_RATIO",
     "pipe_exit_ratio": "PIPE_EXIT_RATIO",
@@ -131,6 +160,7 @@ LIVESTREAM_PROFILE_FIELDS = {
     "max_step_distance": "MAX_STEP_DISTANCE",
     "spawn_band_half": "SPAWN_BAND_HALF",
     "min_start_below_exit": "MIN_START_BELOW_EXIT",
+    "min_candidate_upward_travel": "MIN_CANDIDATE_UPWARD_TRAVEL",
     "candidate_confirm_frames": "CANDIDATE_CONFIRM_FRAMES",
     "candidate_match_distance": "CANDIDATE_MATCH_DISTANCE",
     "candidate_lost_after_frames": "CANDIDATE_LOST_AFTER_FRAMES",
@@ -164,7 +194,7 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Raspberry Pi 5 Camera Livestream</title>
+    <title>Raspberry Pi 5 Livestream</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
@@ -355,6 +385,11 @@ HTML_TEMPLATE = """
 """
 
 
+def reset_tuning_defaults() -> None:
+    for key, value in DEFAULT_TUNING_VALUES.items():
+        globals()[key] = value
+
+
 def build_tracker() -> PrecisionBubbleTracker:
     return PrecisionBubbleTracker(
         TrackerConfig(
@@ -371,16 +406,102 @@ def build_tracker() -> PrecisionBubbleTracker:
             candidate_match_distance=int(CANDIDATE_MATCH_DISTANCE),
             candidate_lost_after_frames=int(CANDIDATE_LOST_AFTER_FRAMES),
             min_start_below_exit=int(MIN_START_BELOW_EXIT),
+            min_candidate_upward_travel=int(MIN_CANDIDATE_UPWARD_TRAVEL),
         )
     )
 
 
-def apply_livestream_profile(profile_path):
+def apply_livestream_profile(profile_path: str | None) -> None:
     global PROFILE_PATH
+    reset_tuning_defaults()
     PROFILE_PATH = profile_path
+    if PROFILE_PATH is None:
+        return
+
     profile_data = load_profile_data(PROFILE_PATH)
     apply_profile_mapping(profile_data.get("shared", {}), SHARED_PROFILE_FIELDS, globals())
     apply_profile_mapping(profile_data.get("livestream", {}), LIVESTREAM_PROFILE_FIELDS, globals())
+
+
+def build_geometry(frame):
+    global dynamic_pipe_center_x
+
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    roi_h, roi_w = roi.shape[:2]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    small = cv2.resize(blur, (64, 48), interpolation=cv2.INTER_AREA)
+    small = cv2.equalizeHist(small)
+
+    fallback_local_center = (roi_w // 2) + int(PIPE_CENTER_X_BIAS)
+    if AUTO_CENTER_ENABLED:
+        dynamic_pipe_center_x = estimate_pipe_center_x(
+            gray_roi=gray,
+            fallback_center_x=fallback_local_center,
+            previous_center_x=dynamic_pipe_center_x,
+            search_width_ratio=float(CENTER_SEARCH_WIDTH_RATIO),
+            smoothing=float(AUTO_CENTER_SMOOTHING),
+            max_offset_px=AUTO_CENTER_MAX_OFFSET_PX,
+        )
+        local_pipe_center_x = dynamic_pipe_center_x
+    else:
+        local_pipe_center_x = fallback_local_center
+
+    pipe_center_x = x1 + local_pipe_center_x
+    pipe_width = int(roi_w * PIPE_WIDTH_RATIO)
+    pipe_lock_width = int(roi_w * PIPE_LOCK_WIDTH_RATIO)
+    pipe_mouth_lock_width = int(roi_w * PIPE_MOUTH_LOCK_WIDTH_RATIO)
+    pipe_top = y1 + int(roi_h * PIPE_TOP_RATIO)
+    pipe_bottom = y1 + int(roi_h * PIPE_BOTTOM_RATIO)
+    pipe_exit_y = y1 + int(roi_h * PIPE_EXIT_RATIO)
+    spawn_y1 = pipe_exit_y - int(SPAWN_BAND_HALF)
+    spawn_y2 = pipe_exit_y + int(SPAWN_BAND_HALF)
+    count_y1 = pipe_exit_y - int(COUNT_BAND_HALF) + int(COUNT_BAND_OFFSET)
+    count_y2 = pipe_exit_y + int(COUNT_BAND_HALF) + int(COUNT_BAND_OFFSET)
+
+    geometry = PipeGeometry(
+        pipe_center_x=pipe_center_x,
+        pipe_lock_width=pipe_lock_width,
+        pipe_mouth_lock_width=pipe_mouth_lock_width,
+        pipe_top=pipe_top,
+        pipe_bottom=pipe_bottom,
+        pipe_exit_y=pipe_exit_y,
+        spawn_y1=spawn_y1,
+        spawn_y2=spawn_y2,
+        count_y1=count_y1,
+        count_y2=count_y2,
+    )
+
+    return {
+        "geometry": geometry,
+        "small": small,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "pipe_width": pipe_width,
+        "roi_w": roi_w,
+        "roi_h": roi_h,
+    }
+
+
+def reset_runtime_state() -> None:
+    global tracker, last_detection_snapshot, dynamic_pipe_center_x
+    tracker = build_tracker()
+    last_detection_snapshot = empty_detection_snapshot()
+    dynamic_pipe_center_x = None
 
 
 @app.route("/")
@@ -422,9 +543,9 @@ def capture():
         request_obj.save("main", filename)
         logger.info("Image captured: %s", filename)
         return jsonify({"success": True, "filename": filename})
-    except Exception as e:
-        logger.exception("Error capturing image: %s", e)
-        return jsonify({"success": False, "error": str(e)})
+    except Exception as exc:
+        logger.exception("Error capturing image: %s", exc)
+        return jsonify({"success": False, "error": str(exc)})
     finally:
         if request_obj is not None:
             try:
@@ -434,7 +555,7 @@ def capture():
 
 
 def frame_capture_thread():
-    global dynamic_pipe_center_x, last_detection_snapshot, tracker
+    global last_detection_snapshot
 
     frame_count = 0
     frame_interval = 1.0 / TARGET_FPS
@@ -455,65 +576,22 @@ def frame_capture_thread():
                     request.release()
 
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            h, w = frame.shape[:2]
-
             if frame_count < 10:
                 continue
 
-            x1, y1, x2, y2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-            if x2 <= x1 or y2 <= y1:
+            geometry_data = build_geometry(frame)
+            if geometry_data is None:
                 continue
 
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
-                continue
-
-            roi_h, roi_w = roi.shape[:2]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (7, 7), 0)
-            small = cv2.resize(blur, (64, 48), interpolation=cv2.INTER_AREA)
-            small = cv2.equalizeHist(small)
-
-            fallback_local_center = (roi_w // 2) + int(PIPE_CENTER_X_BIAS)
-            if AUTO_CENTER_ENABLED:
-                dynamic_pipe_center_x = estimate_pipe_center_x(
-                    gray_roi=gray,
-                    fallback_center_x=fallback_local_center,
-                    previous_center_x=dynamic_pipe_center_x,
-                    search_width_ratio=float(CENTER_SEARCH_WIDTH_RATIO),
-                    smoothing=float(AUTO_CENTER_SMOOTHING),
-                    max_offset_px=AUTO_CENTER_MAX_OFFSET_PX,
-                )
-                local_pipe_center_x = dynamic_pipe_center_x
-            else:
-                local_pipe_center_x = fallback_local_center
-
-            pipe_center_x = x1 + local_pipe_center_x
-            pipe_width = int(roi_w * PIPE_WIDTH_RATIO)
-            pipe_lock_width = int(roi_w * PIPE_LOCK_WIDTH_RATIO)
-            pipe_top = y1 + int(roi_h * PIPE_TOP_RATIO)
-            pipe_bottom = y1 + int(roi_h * PIPE_BOTTOM_RATIO)
-            pipe_exit_y = y1 + int(roi_h * PIPE_EXIT_RATIO)
-            spawn_y1 = pipe_exit_y - int(SPAWN_BAND_HALF)
-            spawn_y2 = pipe_exit_y + int(SPAWN_BAND_HALF)
-            count_y1 = pipe_exit_y - int(COUNT_BAND_HALF) + int(COUNT_BAND_OFFSET)
-            count_y2 = pipe_exit_y + int(COUNT_BAND_HALF) + int(COUNT_BAND_OFFSET)
-
-            geometry = PipeGeometry(
-                pipe_center_x=pipe_center_x,
-                pipe_lock_width=pipe_lock_width,
-                pipe_top=pipe_top,
-                pipe_bottom=pipe_bottom,
-                pipe_exit_y=pipe_exit_y,
-                spawn_y1=spawn_y1,
-                spawn_y2=spawn_y2,
-                count_y1=count_y1,
-                count_y2=count_y2,
-            )
+            geometry = geometry_data["geometry"]
+            x1 = geometry_data["x1"]
+            y1 = geometry_data["y1"]
+            x2 = geometry_data["x2"]
+            y2 = geometry_data["y2"]
+            small = geometry_data["small"]
+            pipe_width = geometry_data["pipe_width"]
+            roi_w = geometry_data["roi_w"]
+            roi_h = geometry_data["roi_h"]
 
             now = time.time()
             if now - last_detect_time > DETECT_INTERVAL:
@@ -540,28 +618,38 @@ def frame_capture_thread():
             if DEBUG_DRAW:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                 cv2.putText(frame, "ROI", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-                cv2.line(frame, (pipe_center_x, y1), (pipe_center_x, y2), (255, 255, 0), 2)
+                cv2.line(frame, (geometry.pipe_center_x, y1), (geometry.pipe_center_x, y2), (255, 255, 0), 2)
                 cv2.rectangle(
                     frame,
-                    (pipe_center_x - pipe_width, pipe_top),
-                    (pipe_center_x + pipe_width, pipe_bottom),
+                    (geometry.pipe_center_x - pipe_width, geometry.pipe_top),
+                    (geometry.pipe_center_x + pipe_width, geometry.pipe_bottom),
                     (255, 0, 255),
                     2,
                 )
                 cv2.rectangle(
                     frame,
-                    (pipe_center_x - pipe_lock_width, pipe_top),
-                    (pipe_center_x + pipe_lock_width, pipe_bottom),
+                    (geometry.pipe_center_x - geometry.pipe_lock_width, geometry.pipe_top),
+                    (geometry.pipe_center_x + geometry.pipe_lock_width, geometry.pipe_bottom),
                     (0, 255, 255),
                     1,
                 )
-                cv2.rectangle(frame, (x1, spawn_y1), (x2, spawn_y2), (0, 165, 255), 1)
-                cv2.putText(frame, "SPAWN BAND", (x1, spawn_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
-                cv2.rectangle(frame, (x1, count_y1), (x2, count_y2), (0, 0, 255), 1)
-                cv2.putText(frame, "COUNT BAND", (x1, count_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                cv2.rectangle(
+                    frame,
+                    (geometry.pipe_center_x - geometry.pipe_mouth_lock_width, geometry.pipe_top),
+                    (geometry.pipe_center_x + geometry.pipe_mouth_lock_width, geometry.pipe_bottom),
+                    (0, 200, 0),
+                    1,
+                )
+                cv2.rectangle(frame, (x1, geometry.spawn_y1), (x2, geometry.spawn_y2), (0, 165, 255), 1)
+                cv2.putText(frame, "SPAWN BAND", (x1, geometry.spawn_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                cv2.rectangle(frame, (x1, geometry.count_y1), (x2, geometry.count_y2), (0, 0, 255), 1)
+                cv2.putText(frame, "COUNT BAND", (x1, geometry.count_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
                 for (cx, cy, r) in last_detection_snapshot["filtered_detections"]:
                     cv2.circle(frame, (cx, cy), max(8, int(r * 2.0)), (0, 255, 255), 2)
+
+                for (cx, cy, r) in last_detection_snapshot["start_candidates"]:
+                    cv2.circle(frame, (cx, cy), max(8, int(r * 2.0)), (0, 200, 0), 1)
 
             if tracker.active_bubble is not None:
                 bubble = tracker.active_bubble
@@ -594,10 +682,10 @@ def frame_capture_thread():
 
             fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
             overlay = frame.copy()
-            ox1 = frame.shape[1] - 320
+            ox1 = frame.shape[1] - 360
             oy1 = 10
             ox2 = frame.shape[1] - 10
-            oy2 = oy1 + 165
+            oy2 = oy1 + 185
             cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), (0, 0, 0), -1)
             frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
 
@@ -610,6 +698,7 @@ def frame_capture_thread():
                 f"Candidate: {1 if tracker.candidate_bubble is not None else 0}",
                 f"Count: {tracker.bubble_count_total}",
                 f"Auto center: {'ON' if AUTO_CENTER_ENABLED else 'OFF'}",
+                f"Profile: {PROFILE_PATH or 'none'}",
             ]:
                 cv2.putText(frame, text, (ox1 + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
                 y += 20
@@ -621,6 +710,7 @@ def frame_capture_thread():
                     output.condition.notify_all()
 
             elapsed = time.time() - start_time
+            frame_interval = 1.0 / TARGET_FPS
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
 
@@ -630,7 +720,7 @@ def frame_capture_thread():
 
 
 def initialize_camera(resolution=(960, 540), fps=30):
-    global camera, streaming, output, Picamera2, tracker, last_detection_snapshot, dynamic_pipe_center_x
+    global camera, streaming, output, Picamera2
     try:
         if Picamera2 is None:
             try:
@@ -641,17 +731,7 @@ def initialize_camera(resolution=(960, 540), fps=30):
                 return False
             Picamera2 = picamera2_class
 
-        tracker = build_tracker()
-        last_detection_snapshot = {
-            "raw_detections": [],
-            "filtered_detections": [],
-            "start_candidates": [],
-            "state": "idle",
-            "started_id": None,
-            "counted": False,
-            "ended_event": None,
-        }
-        dynamic_pipe_center_x = None
+        reset_runtime_state()
 
         logger.info("Initializing camera...")
         camera = Picamera2()
@@ -724,7 +804,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     STREAM_NAME = args.stream_name
-    resolved_profile_path = resolve_profile_path(STREAM_NAME, args.profile)
+    resolved_profile_path = resolve_profile_path(
+        STREAM_NAME,
+        explicit_profile_path=args.profile,
+        fallback_name="PrototypeDataset",
+    )
     if resolved_profile_path is not None:
         apply_livestream_profile(resolved_profile_path)
         logger.info("Using profile: %s", resolved_profile_path)
