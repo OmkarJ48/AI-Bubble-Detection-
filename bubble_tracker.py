@@ -48,6 +48,18 @@ def detect_bubbles(small_gray, scale_x, scale_y, x_offset, y_offset) -> List[Det
     return results
 
 
+def empty_detection_snapshot() -> Dict:
+    return {
+        "raw_detections": [],
+        "filtered_detections": [],
+        "start_candidates": [],
+        "state": "idle",
+        "started_id": None,
+        "counted": False,
+        "ended_event": None,
+    }
+
+
 def validate_profile_path(profile_path: str) -> str:
     resolved_path = Path(profile_path)
     if not resolved_path.is_file():
@@ -156,6 +168,7 @@ def estimate_pipe_center_x(
 class PipeGeometry:
     pipe_center_x: int
     pipe_lock_width: int
+    pipe_mouth_lock_width: int
     pipe_top: int
     pipe_bottom: int
     pipe_exit_y: int
@@ -180,6 +193,7 @@ class TrackerConfig:
     candidate_match_distance: int = 50
     candidate_lost_after_frames: int = 1
     min_start_below_exit: int = 18
+    min_candidate_upward_travel: int = 6
 
 
 class PrecisionBubbleTracker:
@@ -216,7 +230,7 @@ class PrecisionBubbleTracker:
     def _start_eligible(self, det: Detection, g: PipeGeometry) -> bool:
         cx, cy, _ = det
         return (
-            abs(cx - g.pipe_center_x) <= g.pipe_lock_width
+            abs(cx - g.pipe_center_x) <= g.pipe_mouth_lock_width
             and g.spawn_y1 <= cy <= g.spawn_y2
             and cy >= (g.pipe_exit_y + self.config.min_start_below_exit)
         )
@@ -250,7 +264,8 @@ class PrecisionBubbleTracker:
         track["last_seen"] = now
         track["seen_frames"] += 1
         track["lost_frames"] = 0
-        track["min_y"] = min(track["min_y"], track["cy"])
+        if "min_y" in track:
+            track["min_y"] = min(track["min_y"], track["cy"])
 
     def step(self, detections: List[Detection], now: float, geometry: PipeGeometry) -> Dict:
         filtered = self._filter_detections(detections, geometry)
@@ -275,6 +290,8 @@ class PrecisionBubbleTracker:
                         "last_seen": now,
                         "seen_frames": 1,
                         "lost_frames": 0,
+                        "start_y": cy,
+                        "min_y": cy,
                     }
             else:
                 match = self._best_match(
@@ -282,7 +299,7 @@ class PrecisionBubbleTracker:
                     filtered,
                     max_dist=self.config.candidate_match_distance,
                 )
-                if match is not None:
+                if match is not None and abs(match[0] - geometry.pipe_center_x) <= geometry.pipe_mouth_lock_width:
                     self._smooth_update(self.candidate_bubble, match[0], match[1], match[2], now)
                 else:
                     self.candidate_bubble["lost_frames"] += 1
@@ -290,27 +307,31 @@ class PrecisionBubbleTracker:
                 if self.candidate_bubble["lost_frames"] > self.config.candidate_lost_after_frames:
                     self.candidate_bubble = None
 
-            if (
-                self.candidate_bubble is not None
-                and self.candidate_bubble["seen_frames"] >= self.config.candidate_confirm_frames
-            ):
-                bid = self.next_bubble_id
-                self.active_bubble = {
-                    "id": bid,
-                    "cx": self.candidate_bubble["cx"],
-                    "cy": self.candidate_bubble["cy"],
-                    "r": self.candidate_bubble["r"],
-                    "start_x": self.candidate_bubble["cx"],
-                    "start_y": self.candidate_bubble["cy"],
-                    "min_y": self.candidate_bubble["cy"],
-                    "last_seen": now,
-                    "seen_frames": self.candidate_bubble["seen_frames"],
-                    "lost_frames": 0,
-                    "hit_count_band": geometry.count_y1 <= self.candidate_bubble["cy"] <= geometry.count_y2,
-                }
-                started_id = bid
-                self.next_bubble_id += 1
-                self.candidate_bubble = None
+            candidate = self.candidate_bubble
+            if candidate is not None:
+                candidate_travel = candidate["start_y"] - candidate["min_y"]
+                if (
+                    candidate["seen_frames"] >= self.config.candidate_confirm_frames
+                    and candidate_travel >= self.config.min_candidate_upward_travel
+                    and abs(candidate["cx"] - geometry.pipe_center_x) <= geometry.pipe_mouth_lock_width
+                ):
+                    bid = self.next_bubble_id
+                    self.active_bubble = {
+                        "id": bid,
+                        "cx": candidate["cx"],
+                        "cy": candidate["cy"],
+                        "r": candidate["r"],
+                        "start_x": candidate["cx"],
+                        "start_y": candidate["start_y"],
+                        "min_y": candidate["min_y"],
+                        "last_seen": now,
+                        "seen_frames": candidate["seen_frames"],
+                        "lost_frames": 0,
+                        "hit_count_band": geometry.count_y1 <= candidate["cy"] <= geometry.count_y2,
+                    }
+                    started_id = bid
+                    self.next_bubble_id += 1
+                    self.candidate_bubble = None
         else:
             match = self._best_match(self.active_bubble, filtered, max_dist=self.config.max_match_distance)
             if match is not None:
