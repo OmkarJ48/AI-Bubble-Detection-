@@ -39,6 +39,7 @@ node_modules/
 *.pdf
 *.mp4
 !Bubbles*.mp4
+!Prototype Dataset 1/*.mp4
 *.mov
 *.MOV
 bubble_log*.jsonl
