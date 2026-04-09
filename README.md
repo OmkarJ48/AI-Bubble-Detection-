@@ -1,44 +1,39 @@
 # Raspberry Pi Bubble-Tracking Workflow
 
-This document tracks the current working tree in this folder as of 2026-04-02. It is focused on the newer bubble-detection workflow built around:
+This document reflects the current code in this folder as of 2026-04-09.
 
-- `livestream.py` for the Raspberry Pi live camera stream
-- `test_video.py` for offline validation against `Bubbles.mp4`
+The active workflow now uses a shared precision-first tracking core:
 
-The current code no longer matches the older README draft that described generic ROI tracking, motion detection, and recording controls. The sections below follow the behavior that is actually present in the code today.
+- `livestream.py` for Raspberry Pi camera streaming
+- `test_video.py` for offline validation and tuning
+- `bubble_tracker.py` for shared tracking, detection, auto-centering, and profile utilities
 
 ## What the current workflow does
+
+### Shared tracker core: `bubble_tracker.py`
+
+- Implements one precision-first state machine for both apps.
+- States are strictly `idle`, `candidate`, and `active`.
+- Enforces one candidate and one active bubble maximum.
+- Applies strict start gating (pipe lock zone + spawn band + below exit threshold).
+- Applies direction-aware matching (downward/lateral/step limits).
+- Counts only after lock confirmation, minimum upward travel, count-band hit, and disappearance.
 
 ### Live camera app: `livestream.py`
 
 - Streams MJPEG video to a browser.
 - Captures still images from the web UI.
-- Uses a fixed ROI and pipe-geometry filters.
-- Acquires a new bubble only near the pipe mouth spawn band.
-- Tracks one active bubble at a time.
-- Counts that bubble only after it disappears and has traveled upward enough.
-- Keeps in-memory bubble history for ended tracks.
+- Uses shared tracker logic from `bubble_tracker.py`.
+- Supports fixed ROI plus optional live auto-centering.
+- Applies profile-driven tuning from `shared` + `livestream` sections.
 
 ### Video test harness: `test_video.py`
 
-- Reads `Bubbles.mp4` instead of the Raspberry Pi camera.
-- Reuses `detect_bubbles()` from `livestream.py`.
-- Runs a browser view with debug controls and a status endpoint.
-- Uses optional auto-centering to estimate the pipe center from the video.
+- Reads an input video (`Bubbles.mp4` by default).
+- Uses the same shared tracker logic as live mode.
+- Runs a browser view with debug controls and `/status`.
+- Supports optional auto-centering and profile-driven tuning from `shared` + `test_video`.
 - Logs ended bubble events to `bubble_log.jsonl`.
-
-## Prerequisites
-
-- Raspberry Pi 5 with a working camera stack for `livestream.py`
-- Python 3
-- A clean virtual environment
-- `Bubbles.mp4` in this folder for `test_video.py`
-
-The examples below assume your shell is in this directory:
-
-```bash
-/home/pi/Documents/RnD_Camera/RnD_Camera
-```
 
 ## Setup
 
@@ -50,12 +45,6 @@ source venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r ../requirements.txt
 ```
-
-Recommended setup notes:
-
-- Use a fresh virtual environment instead of mixing system packages and old wheel caches.
-- Start from `../requirements.txt` before adding anything else.
-- If OpenCV import errors mention NumPy 2.x vs 1.x compiled modules, rebuild the virtual environment and reinstall the dependencies cleanly.
 
 ## Live camera app
 
@@ -73,12 +62,26 @@ Example with explicit host, port, resolution, and FPS:
 python3 livestream.py --host 0.0.0.0 --port 5000 --resolution 960 540 --fps 30
 ```
 
+Example with profile + stream-name selection:
+
+```bash
+python3 livestream.py --profile profiles/Bubbles2.json --stream-name livestream
+```
+
 Current CLI flags:
 
 - `--host` / `-H` default: `127.0.0.1`
 - `--port` / `-p` default: `5000`
 - `--resolution` / `-r` default: `960 540`
 - `--fps` / `-f` default: `30`
+- `--profile` optional: explicit profile path
+- `--stream-name` default: `livestream` (used for live profile discovery)
+
+Live profile resolution order:
+
+1. explicit `--profile`
+2. `profiles/<stream_name>.json`
+3. fallback `profiles/Bubbles.json`
 
 Default browser URL:
 
@@ -86,23 +89,20 @@ Default browser URL:
 http://127.0.0.1:5000
 ```
 
-If you run with `--host 0.0.0.0`, use the Raspberry Pi IP address from another device.
-
-### Live app behavior
+### Live behavior and overlay
 
 - Camera frames are captured through Picamera2.
-- Frames are converted to BGR and cropped to the configured ROI.
-- Detection runs on a reduced grayscale ROI with blur, resize, histogram equalization, and `cv2.HoughCircles`.
-- Detections are filtered by radius, pipe lock width, and pipe height.
-- When no bubble is active, new detections are accepted only inside the spawn band near the pipe mouth.
-- When a bubble is active, new detections are matched to the current bubble and downward jumps larger than `DOWNWARD_TOLERANCE` are rejected.
-- A bubble is counted only after it is lost and its upward travel meets the threshold.
+- Detection runs on reduced grayscale ROI using `cv2.HoughCircles`.
+- Shared tracker rejects side acquisitions and jitter-driven track switches.
+- New tracks only start in strict start-eligible regions.
+- Count increments only after a qualified bubble disappears.
+- With debug enabled, overlay includes ROI, pipe guides, spawn band, count band, candidate/active markers, and status box with `State`.
 
-### Live UI and outputs
+### Live routes
 
-- `GET /` serves the inline HTML page.
-- `GET /video_feed` serves the MJPEG stream.
-- `GET /capture` saves `image_YYYYMMDD_HHMMSS.jpg` and returns JSON.
+- `GET /`
+- `GET /video_feed`
+- `GET /capture`
 
 Capture response shape:
 
@@ -116,149 +116,41 @@ Failure shape:
 {"success": false, "error": "message"}
 ```
 
-### Live overlay guides
-
-With `DEBUG_DRAW = True`, the live stream draws:
-
-- ROI box
-- pipe center line
-- pipe boundary box
-- pipe lock zone
-- spawn band
-- upward-check band
-- filtered detections
-- active bubble marker
-- FPS / frame / tracking / count summary box
-
 ## Video test harness
 
 ### Run `test_video.py`
+
+Default:
 
 ```bash
 python3 test_video.py
 ```
 
-Current behavior:
+Specific video:
 
-- Opens `Bubbles.mp4`
-- Streams the processed video at port `5001`
-- Loops back to the start when the video ends
-- Uses full-frame ROI for testing
-- Can auto-estimate the pipe center when `AUTO_CENTER_ENABLED = True`
-
-Browser access:
-
-- Local: `http://127.0.0.1:5001`
-- Network: `http://<raspberry-pi-ip>:5001`
-
-### Test UI and outputs
-
-- `GET /` serves the HTML test page.
-- `GET /video_feed` serves the MJPEG test stream.
-- `POST /toggle_debug` flips the overlay state.
-- `POST /reset_counter` clears the counter, history, and active bubble.
-- `GET /status` reports the current UI state.
-
-Status response shape:
-
-```json
-{
-  "debug": true,
-  "count": 0,
-  "active_bubble": false,
-  "auto_center": true
-}
+```bash
+python3 test_video.py --video Bubbles2.mp4
 ```
 
-The test harness also appends ended bubble events to:
+Specific video + explicit profile:
+
+```bash
+python3 test_video.py --video Bubbles2.mp4 --profile profiles/Bubbles2.json
+```
+
+Test profile resolution order:
+
+1. explicit `--profile`
+2. `profiles/<video_stem>.json`
+3. fallback `profiles/Bubbles.json`
+
+Default browser URL:
 
 ```text
-bubble_log.jsonl
+http://127.0.0.1:5001
 ```
 
-Each log line is JSON and includes fields such as bubble ID, whether it was counted, start/end coordinates, seen frames, and end time.
-
-### Counting behavior in the test harness
-
-The test harness is similar to the live tracker but not identical:
-
-- it still tracks one active bubble at a time
-- it counts once the bubble has moved enough and enters the count band
-- it logs the ended bubble event after the track is lost
-
-## Tuning reference
-
-These are the main constants worth adjusting in the current code.
-
-### ROI
-
-Live app:
-
-- `ROI_X1 = 250`
-- `ROI_Y1 = 140`
-- `ROI_X2 = 760`
-- `ROI_Y2 = 500`
-
-### Pipe geometry
-
-Used by both scripts:
-
-- `PIPE_CENTER_X_BIAS = -50`
-- `PIPE_WIDTH_RATIO = 0.35`
-- `PIPE_LOCK_WIDTH_RATIO = 0.18`
-- `PIPE_TOP_RATIO = 0.25`
-- `PIPE_BOTTOM_RATIO = 0.75`
-- `PIPE_EXIT_RATIO = 0.55`
-
-### Detection timing
-
-- Live app: `DETECT_INTERVAL = 0.08`
-- Test harness: `DETECT_EVERY_SECONDS = 0.10`
-
-### Bubble size filters
-
-- Live app: `MIN_RADIUS = 4`, `MAX_RADIUS = 20`
-- Test harness: `MIN_RADIUS = 10`, `MAX_RADIUS = 20`
-
-### Tracking thresholds
-
-Live app:
-
-- `LOCK_AFTER_FRAMES = 2`
-- `LOST_AFTER_FRAMES = 4`
-- `MIN_UPWARD_TRAVEL = 30`
-- `MAX_MATCH_DISTANCE = 70`
-- `DOWNWARD_TOLERANCE = 10`
-- `SPAWN_BAND_HALF = 22`
-
-Test harness:
-
-- `LOCK_AFTER_FRAMES = 2`
-- `LOST_AFTER_FRAMES = 3`
-- `MIN_TRAVEL_Y = 18`
-- `MAX_MATCH_DISTANCE = 60`
-- `COUNT_BAND_HALF = 12`
-
-### Auto-centering in the test harness
-
-- `AUTO_CENTER_ENABLED = True`
-- `AUTO_CENTER_SMOOTHING = 0.80`
-- `CENTER_SEARCH_WIDTH_RATIO = 0.35`
-
-### Debug drawing and frame rate
-
-- `TARGET_FPS = 20` in both scripts
-- `DEBUG_DRAW = True` in both scripts
-
-## HTTP interface summary
-
-### `livestream.py`
-
-- `GET /`
-- `GET /video_feed`
-- `GET /capture`
-
-### `test_video.py`
+### Test routes and status
 
 - `GET /`
 - `GET /video_feed`
@@ -266,28 +158,50 @@ Test harness:
 - `POST /reset_counter`
 - `GET /status`
 
-## File outputs
+Current status response shape:
 
-- Captured live images: `image_YYYYMMDD_HHMMSS.jpg`
+```json
+{
+  "video": "Bubbles2.mp4",
+  "profile": "profiles/Bubbles2.json",
+  "debug": true,
+  "count": 0,
+  "state": "idle",
+  "active_bubble": false,
+  "candidate_bubble": false,
+  "auto_center": true
+}
+```
+
+### Event log output
+
 - Test-harness event log: `bubble_log.jsonl`
+- Captured live still images: `image_YYYYMMDD_HHMMSS.jpg`
 
-`Bubbles.mp4` is the sample input video used by `test_video.py`.
+## Profile schema and key tuning fields
 
-## Known issues and environment notes
+Profiles under `profiles/` use:
 
-The current workflow assumes a compatible Python environment for NumPy and OpenCV.
+```json
+{
+  "shared": {},
+  "test_video": {},
+  "livestream": {}
+}
+```
 
-If `livestream.py` fails before startup with an OpenCV import error, the usual cause is a NumPy/OpenCV wheel mismatch in the active virtual environment.
+Commonly tuned fields now include:
 
-Practical impact:
+- pipe geometry (`pipe_center_x_bias`, `pipe_width_ratio`, `pipe_lock_width_ratio`, `pipe_top_ratio`, `pipe_bottom_ratio`, `pipe_exit_ratio`)
+- acquisition/count bands (`spawn_band_half`, `count_band_half`, `count_band_offset`, `min_start_below_exit`)
+- tracking gates (`lock_after_frames`, `lost_after_frames`, `min_upward_travel`/`min_travel_y`)
+- match/jitter limits (`max_match_distance`, `downward_tolerance`, `max_lateral_shift`, `max_step_distance`)
+- candidate behavior (`candidate_confirm_frames`, `candidate_match_distance`, `candidate_lost_after_frames`)
+- auto-centering (`auto_center_enabled`, `auto_center_smoothing`, `center_search_width_ratio`, `auto_center_max_offset_px`)
 
-- the app code can be valid while the local environment still refuses to import `cv2`
-- rebuilding the virtual environment and reinstalling from `../requirements.txt` is the recommended first fix
+## Known environment notes
 
-## Related files
+- `livestream.py` requires a working Picamera2 stack on Raspberry Pi.
+- Both scripts require compatible OpenCV/NumPy wheels.
+- If OpenCV import fails, rebuild the venv and reinstall from `../requirements.txt`.
 
-- `livestream.py`
-- `test_video.py`
-- `Bubbles.mp4`
-- `bubble_log.jsonl`
-- `../requirements.txt`
