@@ -9,23 +9,25 @@ Single-bubble pipe-locked tracker:
 """
 
 import io
-import threading
 import logging
+import threading
 import time
-import numpy as np
-import cv2
-
 from datetime import datetime
-from flask import Flask, render_template_string, Response, jsonify
+
+import cv2
+import numpy as np
+from flask import Flask, Response, jsonify, render_template_string
 
 # =========================
 # GLOBAL STATE / TUNING
 # =========================
 output = None
 camera = None
+video_capture = None
 streaming = False
 recording = False
 recording_output = None
+source_label = "camera"
 
 active_bubble = None
 candidate_bubble = None
@@ -34,6 +36,7 @@ next_bubble_id = 1
 bubble_count_total = 0
 
 TARGET_FPS = 20
+WARMUP_FRAMES = 35
 
 # ROI
 ROI_X1 = 250
@@ -45,30 +48,36 @@ ROI_Y2 = 500
 PIPE_CENTER_X_BIAS = -50
 PIPE_WIDTH_RATIO = 0.35
 PIPE_LOCK_WIDTH_RATIO = 0.18
+PIPE_MOUTH_LOCK_WIDTH_RATIO = 0.10
 PIPE_TOP_RATIO = 0.25
 PIPE_BOTTOM_RATIO = 0.75
 PIPE_EXIT_RATIO = 0.55
 
 # Tracking logic
 LOCK_AFTER_FRAMES = 2
-LOST_AFTER_FRAMES = 4
-MIN_UPWARD_TRAVEL = 36
-MAX_MATCH_DISTANCE = 70
+LOST_AFTER_FRAMES = 6
+MIN_UPWARD_TRAVEL = 18
+MIN_CANDIDATE_UPWARD_TRAVEL = 0
+MAX_MATCH_DISTANCE = 90
+CANDIDATE_MATCH_DISTANCE = 50
 DOWNWARD_TOLERANCE = 10
+MAX_LATERAL_SHIFT = 32
+MAX_STEP_DISTANCE = 80
 
 # Detection logic
-DETECT_INTERVAL = 0.08
+DETECT_INTERVAL = 0.05
 MIN_RADIUS = 4
 MAX_RADIUS = 20
 
 # Acquisition band: only start a new bubble near pipe mouth
-SPAWN_BAND_HALF = 22
-MIN_START_BELOW_EXIT = 14
-CANDIDATE_CONFIRM_FRAMES = 4
-CANDIDATE_MATCH_DISTANCE = 55
+SPAWN_BAND_HALF = 28
+MIN_START_BELOW_EXIT = 0
+CANDIDATE_CONFIRM_FRAMES = 2
+CANDIDATE_LOST_AFTER_FRAMES = 3
 
 # Visual / logic band
 COUNT_BAND_HALF = 12
+COUNT_BAND_OFFSET = -30
 
 # Debug
 DEBUG_DRAW = True
@@ -90,8 +99,7 @@ class StreamingOutput(io.BufferedIOBase):
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("Error: picamera2 is not installed")
-    raise SystemExit(1)
+    Picamera2 = None
 
 
 logging.basicConfig(
@@ -344,9 +352,9 @@ def capture():
         logger.info("Image captured: %s", filename)
         return jsonify({"success": True, "filename": filename})
 
-    except Exception as e:
-        logger.exception("Error capturing image: %s", e)
-        return jsonify({"success": False, "error": str(e)})
+    except Exception as exc:
+        logger.exception("Error capturing image: %s", exc)
+        return jsonify({"success": False, "error": str(exc)})
 
     finally:
         if request_obj is not None:
@@ -383,18 +391,53 @@ def detect_bubbles(small_gray, scale_x, scale_y, x_offset, y_offset):
         return results
 
     circles = np.round(circles[0]).astype(int)
-
     for (x, y, r) in circles:
         if x < 0 or y < 0 or x >= small_gray.shape[1] or y >= small_gray.shape[0]:
             continue
 
         cx = int(x * scale_x) + x_offset
         cy = int(y * scale_y) + y_offset
-        rr = int(r)
-
-        results.append((cx, cy, rr))
+        results.append((cx, cy, int(r)))
 
     return results
+
+
+def reset_tracker_state():
+    global active_bubble, candidate_bubble, bubble_history, next_bubble_id, bubble_count_total
+    active_bubble = None
+    candidate_bubble = None
+    bubble_history = []
+    next_bubble_id = 1
+    bubble_count_total = 0
+
+
+def read_source_frame():
+    global camera, video_capture
+
+    if video_capture is not None:
+        ok, frame = video_capture.read()
+        if ok:
+            return frame
+
+        # Loop local files so the tracker can keep testing against the same clip.
+        if video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0):
+            ok, frame = video_capture.read()
+            if ok:
+                return frame
+        return None
+
+    if camera is None:
+        return None
+
+    request = None
+    try:
+        request = camera.capture_request()
+        frame = request.make_array("main")
+    finally:
+        if request is not None:
+            request.release()
+
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
 
 def frame_capture_thread():
@@ -405,7 +448,6 @@ def frame_capture_thread():
     last_detect_time = 0.0
 
     logger.info("Frame capture thread started")
-    print("THREAD STARTED")
 
     while streaming:
         start_time = time.time()
@@ -413,19 +455,13 @@ def frame_capture_thread():
         try:
             frame_count += 1
 
-            request = None
-            try:
-                request = camera.capture_request()
-                frame = request.make_array("main")
-                _lores = request.make_array("lores")
-            finally:
-                if request is not None:
-                    request.release()
-
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frame = read_source_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
             h, w = frame.shape[:2]
 
-            if frame_count < 25:
+            if frame_count < WARMUP_FRAMES:
                 continue
 
             x1, y1, x2, y2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
@@ -433,7 +469,6 @@ def frame_capture_thread():
             y1 = max(0, y1)
             x2 = min(w, x2)
             y2 = min(h, y2)
-
             if x2 <= x1 or y2 <= y1:
                 continue
 
@@ -452,6 +487,7 @@ def frame_capture_thread():
             pipe_center_x = x_offset + (roi_w // 2) + PIPE_CENTER_X_BIAS
             pipe_width = int(roi_w * PIPE_WIDTH_RATIO)
             pipe_lock_width = int(roi_w * PIPE_LOCK_WIDTH_RATIO)
+            pipe_mouth_lock_width = int(roi_w * PIPE_MOUTH_LOCK_WIDTH_RATIO)
             pipe_top = y_offset + int(roi_h * PIPE_TOP_RATIO)
             pipe_bottom = y_offset + int(roi_h * PIPE_BOTTOM_RATIO)
             pipe_exit_y = y_offset + int(roi_h * PIPE_EXIT_RATIO)
@@ -459,41 +495,13 @@ def frame_capture_thread():
             spawn_y1 = pipe_exit_y - SPAWN_BAND_HALF
             spawn_y2 = pipe_exit_y + SPAWN_BAND_HALF
             start_min_y = pipe_exit_y + MIN_START_BELOW_EXIT
-
-            count_y1 = pipe_exit_y - COUNT_BAND_HALF - 30
-            count_y2 = pipe_exit_y + COUNT_BAND_HALF - 30
-
-            if DEBUG_DRAW:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cv2.putText(frame, "ROI", (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-
-                cv2.line(frame, (pipe_center_x, y1), (pipe_center_x, y2), (255, 255, 0), 2)
-                cv2.rectangle(
-                    frame,
-                    (pipe_center_x - pipe_width, pipe_top),
-                    (pipe_center_x + pipe_width, pipe_bottom),
-                    (255, 0, 255), 2
-                )
-                cv2.rectangle(
-                    frame,
-                    (pipe_center_x - pipe_lock_width, pipe_top),
-                    (pipe_center_x + pipe_lock_width, pipe_bottom),
-                    (0, 255, 255), 1
-                )
-                cv2.rectangle(frame, (x1, spawn_y1), (x2, spawn_y2), (0, 165, 255), 1)
-                cv2.putText(frame, "SPAWN BAND", (x1, spawn_y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
-                cv2.line(frame, (x1, start_min_y), (x2, start_min_y), (80, 180, 255), 1)
-                cv2.putText(frame, "START BELOW", (x1 + 5, start_min_y - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 180, 255), 1)
-                cv2.rectangle(frame, (x1, count_y1), (x2, count_y2), (0, 0, 255), 1)
-                cv2.putText(frame, "UPWARD CHECK", (x1, count_y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            count_y1 = pipe_exit_y - COUNT_BAND_HALF + COUNT_BAND_OFFSET
+            count_y2 = pipe_exit_y + COUNT_BAND_HALF + COUNT_BAND_OFFSET
 
             detections = []
-
+            detection_ran = False
             if time.time() - last_detect_time > DETECT_INTERVAL:
+                detection_ran = True
                 raw_detections = detect_bubbles(
                     small_gray=small,
                     scale_x=roi_w / 64,
@@ -507,25 +515,28 @@ def frame_capture_thread():
                     (cx, cy, r)
                     for (cx, cy, r) in raw_detections
                     if MIN_RADIUS <= r <= MAX_RADIUS
-                ]
-
-                filtered = [
-                    (cx, cy, r)
-                    for (cx, cy, r) in filtered
-                    if abs(cx - pipe_center_x) <= pipe_lock_width and pipe_top <= cy <= pipe_bottom
+                    and pipe_top <= cy <= pipe_bottom
+                    and abs(cx - pipe_center_x) <= pipe_lock_width
                 ]
 
                 if active_bubble is None:
                     filtered = [
                         (cx, cy, r)
                         for (cx, cy, r) in filtered
-                        if start_min_y <= cy <= spawn_y2
+                        if spawn_y1 <= cy <= spawn_y2
+                        and cy >= start_min_y
+                        and abs(cx - pipe_center_x) <= pipe_mouth_lock_width
                     ]
                     filtered = sorted(
                         filtered,
-                        key=lambda d: (abs(d[0] - pipe_center_x), -d[2])
+                        key=lambda d: (abs(d[0] - pipe_center_x), abs(d[1] - pipe_exit_y), -d[2])
                     )
                 else:
+                    filtered = [
+                        (cx, cy, r)
+                        for (cx, cy, r) in filtered
+                        if abs(cx - active_bubble["cx"]) <= MAX_LATERAL_SHIFT
+                    ]
                     filtered = sorted(
                         filtered,
                         key=lambda d: distance((d[0], d[1]), (active_bubble["cx"], active_bubble["cy"]))
@@ -533,81 +544,116 @@ def frame_capture_thread():
 
                 detections = filtered
 
-                print(f"RAW detections: {len(raw_detections)} -> {raw_detections}")
-                print(f"FILTERED detections: {len(detections)} -> {detections}")
-
-            if DEBUG_DRAW:
-                for (cx, cy, r) in detections:
-                    draw_r = max(8, int(r * 2.0))
-                    cv2.circle(frame, (cx, cy), draw_r, (0, 255, 255), 2)
-
             now = time.time()
 
             if active_bubble is None:
-                if detections:
-                    cx, cy, r = detections[0]
+                if detection_ran and detections:
                     if candidate_bubble is None:
+                        cx, cy, r = detections[0]
                         candidate_bubble = {
                             "cx": cx,
                             "cy": cy,
                             "r": r,
+                            "start_x": cx,
+                            "start_y": cy,
+                            "min_y": cy,
                             "seen_frames": 1,
+                            "lost_frames": 0,
                             "last_seen": now,
                         }
                     else:
-                        candidate_dist = distance(
-                            (cx, cy),
-                            (candidate_bubble["cx"], candidate_bubble["cy"])
+                        cx, cy, r = min(
+                            detections,
+                            key=lambda det: distance(
+                                (det[0], det[1]),
+                                (candidate_bubble["cx"], candidate_bubble["cy"])
+                            )
                         )
-                        if candidate_dist <= CANDIDATE_MATCH_DISTANCE:
+                        candidate_dist = distance((cx, cy), (candidate_bubble["cx"], candidate_bubble["cy"]))
+                        dx = abs(cx - candidate_bubble["cx"])
+                        dy = candidate_bubble["cy"] - cy
+                        if (
+                            candidate_dist <= CANDIDATE_MATCH_DISTANCE
+                            and dx <= MAX_LATERAL_SHIFT
+                            and dy >= -DOWNWARD_TOLERANCE
+                            and abs(cx - pipe_center_x) <= pipe_mouth_lock_width
+                        ):
                             candidate_bubble["cx"] = int(0.7 * candidate_bubble["cx"] + 0.3 * cx)
                             candidate_bubble["cy"] = int(0.7 * candidate_bubble["cy"] + 0.3 * cy)
                             candidate_bubble["r"] = r
                             candidate_bubble["seen_frames"] += 1
+                            candidate_bubble["lost_frames"] = 0
                             candidate_bubble["last_seen"] = now
+                            candidate_bubble["min_y"] = min(candidate_bubble["min_y"], candidate_bubble["cy"])
                         else:
                             candidate_bubble = {
                                 "cx": cx,
                                 "cy": cy,
                                 "r": r,
+                                "start_x": cx,
+                                "start_y": cy,
+                                "min_y": cy,
                                 "seen_frames": 1,
+                                "lost_frames": 0,
                                 "last_seen": now,
                             }
+                elif detection_ran and candidate_bubble is not None:
+                    candidate_bubble["lost_frames"] += 1
 
-                    if candidate_bubble["seen_frames"] >= CANDIDATE_CONFIRM_FRAMES:
+                if (
+                    detection_ran
+                    and candidate_bubble is not None
+                    and candidate_bubble["lost_frames"] > CANDIDATE_LOST_AFTER_FRAMES
+                ):
+                    candidate_bubble = None
+
+                if candidate_bubble is not None:
+                    candidate_travel = candidate_bubble["start_y"] - candidate_bubble["min_y"]
+                    if (
+                        candidate_bubble["seen_frames"] >= CANDIDATE_CONFIRM_FRAMES
+                        and candidate_travel >= MIN_CANDIDATE_UPWARD_TRAVEL
+                        and abs(candidate_bubble["cx"] - pipe_center_x) <= pipe_mouth_lock_width
+                    ):
                         active_bubble = {
                             "id": next_bubble_id,
                             "cx": candidate_bubble["cx"],
                             "cy": candidate_bubble["cy"],
                             "r": candidate_bubble["r"],
-                            "start_x": candidate_bubble["cx"],
-                            "start_y": candidate_bubble["cy"],
-                            "min_y": candidate_bubble["cy"],
+                            "start_x": candidate_bubble["start_x"],
+                            "start_y": candidate_bubble["start_y"],
+                            "min_y": candidate_bubble["min_y"],
                             "last_seen": now,
                             "seen_frames": candidate_bubble["seen_frames"],
                             "lost_frames": 0,
+                            "hit_count_band": count_y1 <= candidate_bubble["cy"] <= count_y2,
                         }
-                        print(f"START bubble {next_bubble_id} at ({active_bubble['cx']}, {active_bubble['cy']})")
+                        logger.info("START bubble %s at (%s, %s)", next_bubble_id, active_bubble["cx"], active_bubble["cy"])
                         next_bubble_id += 1
                         candidate_bubble = None
-                else:
-                    candidate_bubble = None
             else:
                 best_det = None
                 best_dist = 999999.0
 
-                for det in detections:
-                    cx, cy, r = det
+                if detection_ran:
+                    for det in detections:
+                        cx, cy, r = det
+                        dx = cx - active_bubble["cx"]
+                        dy = cy - active_bubble["cy"]
 
-                    if cy > active_bubble["cy"] + DOWNWARD_TOLERANCE:
-                        continue
+                        if dy > DOWNWARD_TOLERANCE:
+                            continue
+                        if abs(dx) > MAX_LATERAL_SHIFT:
+                            continue
 
-                    d = distance((cx, cy), (active_bubble["cx"], active_bubble["cy"]))
-                    if d < best_dist:
-                        best_dist = d
-                        best_det = det
+                        step_dist = distance((cx, cy), (active_bubble["cx"], active_bubble["cy"]))
+                        if step_dist > MAX_MATCH_DISTANCE or step_dist > MAX_STEP_DISTANCE:
+                            continue
 
-                if best_det is not None and best_dist < MAX_MATCH_DISTANCE:
+                        if step_dist < best_dist:
+                            best_dist = step_dist
+                            best_det = det
+
+                if detection_ran and best_det is not None:
                     cx, cy, r = best_det
                     active_bubble["cx"] = int(0.7 * active_bubble["cx"] + 0.3 * cx)
                     active_bubble["cy"] = int(0.7 * active_bubble["cy"] + 0.3 * cy)
@@ -616,25 +662,29 @@ def frame_capture_thread():
                     active_bubble["seen_frames"] += 1
                     active_bubble["lost_frames"] = 0
                     active_bubble["min_y"] = min(active_bubble["min_y"], active_bubble["cy"])
-                else:
+                    if count_y1 <= active_bubble["cy"] <= count_y2:
+                        active_bubble["hit_count_band"] = True
+                elif detection_ran:
                     active_bubble["lost_frames"] += 1
 
             if active_bubble is not None and active_bubble["lost_frames"] >= LOST_AFTER_FRAMES:
                 traveled_up = active_bubble["start_y"] - active_bubble["min_y"]
-
                 should_count = (
                     active_bubble["seen_frames"] >= LOCK_AFTER_FRAMES
                     and traveled_up >= MIN_UPWARD_TRAVEL
-                    and active_bubble["min_y"] <= count_y2
+                    and bool(active_bubble["hit_count_band"])
                 )
 
                 if should_count:
                     bubble_count_total += 1
-                    print(f"COUNTED bubble {active_bubble['id']} total={bubble_count_total}")
+                    logger.info("COUNTED bubble %s total=%s", active_bubble["id"], bubble_count_total)
                 else:
-                    print(
-                        f"DROPPED bubble {active_bubble['id']} "
-                        f"seen_frames={active_bubble['seen_frames']} traveled_up={traveled_up}"
+                    logger.info(
+                        "DROPPED bubble %s seen_frames=%s traveled_up=%s hit_count_band=%s",
+                        active_bubble["id"],
+                        active_bubble["seen_frames"],
+                        traveled_up,
+                        active_bubble["hit_count_band"],
                     )
 
                 bubble_history.append({
@@ -647,24 +697,54 @@ def frame_capture_thread():
                     "min_y": active_bubble["min_y"],
                     "seen_frames": active_bubble["seen_frames"],
                     "traveled_up": traveled_up,
+                    "hit_count_band": active_bubble["hit_count_band"],
                     "ended_at": now,
                 })
-
-                print(f"ENDED bubble {active_bubble['id']} counted={should_count}")
+                logger.info("ENDED bubble %s counted=%s", active_bubble["id"], should_count)
                 active_bubble = None
+
+            if DEBUG_DRAW:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(frame, "ROI", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                cv2.line(frame, (pipe_center_x, y1), (pipe_center_x, y2), (255, 255, 0), 2)
+                cv2.rectangle(
+                    frame,
+                    (pipe_center_x - pipe_width, pipe_top),
+                    (pipe_center_x + pipe_width, pipe_bottom),
+                    (255, 0, 255), 2
+                )
+                cv2.rectangle(
+                    frame,
+                    (pipe_center_x - pipe_lock_width, pipe_top),
+                    (pipe_center_x + pipe_lock_width, pipe_bottom),
+                    (0, 255, 255), 1
+                )
+                cv2.rectangle(
+                    frame,
+                    (pipe_center_x - pipe_mouth_lock_width, pipe_top),
+                    (pipe_center_x + pipe_mouth_lock_width, pipe_bottom),
+                    (0, 200, 0),
+                    1
+                )
+                cv2.rectangle(frame, (x1, spawn_y1), (x2, spawn_y2), (0, 165, 255), 1)
+                cv2.putText(frame, "SPAWN BAND", (x1, spawn_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                cv2.line(frame, (x1, start_min_y), (x2, start_min_y), (80, 180, 255), 1)
+                cv2.putText(frame, "START BELOW", (x1 + 5, start_min_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 180, 255), 1)
+                cv2.rectangle(frame, (x1, count_y1), (x2, count_y2), (0, 0, 255), 1)
+                cv2.putText(frame, "COUNT BAND", (x1, count_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+                for (cx, cy, r) in detections:
+                    draw_r = max(8, int(r * 2.0))
+                    cv2.circle(frame, (cx, cy), draw_r, (0, 255, 255), 2)
 
             if active_bubble is not None:
                 cx = active_bubble["cx"]
                 cy = active_bubble["cy"]
                 r = max(10, int(active_bubble["r"] * 2.5))
                 bid = active_bubble["id"]
-
                 cv2.circle(frame, (cx, cy), r, (0, 255, 0), 2)
                 cv2.circle(frame, (cx, cy), 4, (0, 255, 0), -1)
-                cv2.putText(
-                    frame, f"ID {bid} TRACKING", (cx + 10, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
-                )
+                cv2.putText(frame, f"ID {bid} TRACKING", (cx + 10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             elif candidate_bubble is not None and DEBUG_DRAW:
                 cv2.circle(
                     frame,
@@ -686,13 +766,12 @@ def frame_capture_thread():
             fps = min(30, 1.0 / max(time.time() - start_time, 1e-6))
 
             overlay = frame.copy()
-            box_width = 280
-            box_height = 135
+            box_width = 320
+            box_height = 175
             ox1 = frame.shape[1] - box_width - 10
             oy1 = 10
             ox2 = frame.shape[1] - 10
             oy2 = oy1 + box_height
-
             cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), (0, 0, 0), -1)
             frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
 
@@ -704,8 +783,9 @@ def frame_capture_thread():
                 f"Tracking: {1 if active_bubble is not None else 0}",
                 f"Candidate: {1 if candidate_bubble is not None else 0}",
                 f"Count: {bubble_count_total}",
+                f"Source: {source_label[:26]}",
                 f"Pipe bias: {PIPE_CENTER_X_BIAS}",
-                f"One bubble mode",
+                f"Mouth lock: {pipe_mouth_lock_width}",
             ]
 
             for text in texts:
@@ -725,33 +805,44 @@ def frame_capture_thread():
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
 
-        except Exception as e:
-            print("Thread error:", e)
-            logger.exception("Frame capture thread error")
+        except Exception as exc:
+            logger.exception("Frame capture thread error: %s", exc)
             time.sleep(0.1)
 
 
-def initialize_camera(resolution=(960, 540), fps=30):
-    global camera, streaming, output
+def initialize_camera(resolution=(960, 540), fps=30, source=None):
+    global camera, video_capture, streaming, output, source_label
 
     try:
-        logger.info("Initializing camera...")
-        camera = Picamera2()
-
-        config = camera.create_video_configuration(
-            main={"size": resolution},
-            lores={"size": (320, 240), "format": "RGB888"},
-            controls={"FrameRate": fps},
-            buffer_count=2,
-        )
-
-        camera.configure(config)
-        camera.start()
-
+        reset_tracker_state()
         output = StreamingOutput()
-        streaming = True
 
-        time.sleep(0.5)
+        if source:
+            logger.info("Opening video source: %s", source)
+            video_capture = cv2.VideoCapture(source)
+            if not video_capture.isOpened():
+                raise RuntimeError(f"Unable to open video source: {source}")
+            source_label = source
+        else:
+            if Picamera2 is None:
+                raise RuntimeError("picamera2 is not installed; use --source for a file or stream input")
+
+            logger.info("Initializing camera...")
+            camera = Picamera2()
+
+            config = camera.create_video_configuration(
+                main={"size": resolution},
+                lores={"size": (320, 240), "format": "RGB888"},
+                controls={"FrameRate": fps},
+                buffer_count=2,
+            )
+
+            camera.configure(config)
+            camera.start()
+            source_label = "camera"
+            time.sleep(0.5)
+
+        streaming = True
 
         capture_thread = threading.Thread(
             target=frame_capture_thread,
@@ -759,13 +850,21 @@ def initialize_camera(resolution=(960, 540), fps=30):
         )
         capture_thread.start()
 
-        logger.info("Camera initialized: %s @ %sfps", resolution, fps)
+        logger.info("Stream initialized from %s", source_label)
         return True
 
-    except Exception as e:
-        logger.exception("Error initializing camera: %s", e)
+    except Exception as exc:
+        logger.exception("Error initializing source: %s", exc)
         streaming = False
         output = None
+        source_label = "camera"
+
+        if video_capture is not None:
+            try:
+                video_capture.release()
+            except Exception:
+                pass
+            video_capture = None
 
         if camera is not None:
             try:
@@ -778,10 +877,17 @@ def initialize_camera(resolution=(960, 540), fps=30):
 
 
 def cleanup_camera():
-    global camera, streaming, recording, output
+    global camera, video_capture, streaming, recording, output, source_label
 
     streaming = False
     time.sleep(0.2)
+
+    if video_capture is not None:
+        try:
+            video_capture.release()
+        except Exception:
+            pass
+        video_capture = None
 
     if camera is not None:
         try:
@@ -805,10 +911,11 @@ def cleanup_camera():
             camera = None
             logger.info("Camera cleaned up")
 
-        except Exception as e:
-            logger.exception("Error cleaning up camera: %s", e)
+        except Exception as exc:
+            logger.exception("Error cleaning up camera: %s", exc)
 
     output = None
+    source_label = "camera"
 
 
 if __name__ == "__main__":
@@ -820,12 +927,17 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--host", type=str, default="127.0.0.1")
     parser.add_argument("-r", "--resolution", type=int, nargs=2, default=[960, 540])
     parser.add_argument("-f", "--fps", type=int, default=30)
+    parser.add_argument(
+        "-s", "--source",
+        type=str,
+        help="Optional video file or MJPEG/stream URL. If omitted, the Pi camera is used."
+    )
     args = parser.parse_args()
 
     atexit.register(cleanup_camera)
 
     try:
-        if initialize_camera(tuple(args.resolution), args.fps):
+        if initialize_camera(tuple(args.resolution), args.fps, args.source):
             logger.info("Starting livestream server on http://%s:%s", args.host, args.port)
             app.run(
                 host=args.host,
@@ -838,8 +950,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 
-    except Exception as e:
-        logger.exception("Fatal error: %s", e)
+    except Exception as exc:
+        logger.exception("Fatal error: %s", exc)
 
     finally:
         cleanup_camera()
