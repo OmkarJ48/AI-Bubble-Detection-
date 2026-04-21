@@ -7,8 +7,7 @@
   const streamShell = document.getElementById("stream-shell");
   const streamEl = document.getElementById("stream");
   const roiBox = document.getElementById("roi-box");
-  const countEl = document.getElementById("count");
-  const errorEl = document.getElementById("camera-error");
+  const roiHandle = document.getElementById("roi-handle");
   const resetBackgroundButton = document.getElementById("reset-background-button");
   const resetCountButton = document.getElementById("reset-count-button");
 
@@ -17,33 +16,31 @@
   const resetBackgroundUrl =
     root.dataset.resetBackgroundUrl || "/reset-background";
   const resetCountUrl = root.dataset.resetCountUrl || "/reset-count";
+  const roiUrl = root.dataset.roiUrl || "/roi";
+  const minRoiSize = 20;
 
   let actionInFlight = false;
   let refreshInFlight = false;
   let frameWidth = 640;
   let frameHeight = 480;
   let roi = null;
+  let dragMode = null;
+  let pendingStatusRefresh = false;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+  let resizeStart = null;
 
   streamEl.src = streamUrl;
 
   function setButtonsDisabled(disabled) {
     resetBackgroundButton.disabled = disabled;
-    resetCountButton.disabled = disabled;
-  }
-
-  function setError(message) {
-    if (!message) {
-      errorEl.hidden = true;
-      errorEl.textContent = "";
-      return;
+    if (resetCountButton) {
+      resetCountButton.disabled = disabled;
     }
-
-    errorEl.hidden = false;
-    errorEl.textContent = message;
   }
 
-  function setCount(count) {
-    countEl.textContent = Number.isFinite(count) ? String(count) : "0";
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
   }
 
   function getImageViewport() {
@@ -55,7 +52,6 @@
 
     const frameAspect = frameWidth / frameHeight;
     const shellAspect = shellWidth / shellHeight;
-
     let width;
     let height;
 
@@ -73,6 +69,26 @@
       width,
       height,
     };
+  }
+
+  function scaleX(value) {
+    const viewport = getImageViewport();
+    return viewport ? (value / frameWidth) * viewport.width : 0;
+  }
+
+  function scaleY(value) {
+    const viewport = getImageViewport();
+    return viewport ? (value / frameHeight) * viewport.height : 0;
+  }
+
+  function pxToFrameX(value) {
+    const viewport = getImageViewport();
+    return viewport ? Math.round((value / viewport.width) * frameWidth) : 0;
+  }
+
+  function pxToFrameY(value) {
+    const viewport = getImageViewport();
+    return viewport ? Math.round((value / viewport.height) * frameHeight) : 0;
   }
 
   function renderRoi() {
@@ -104,20 +120,22 @@
       }
 
       const data = await response.json();
-      setCount(data.count);
-      setError(data.camera_error ? `Camera error: ${data.camera_error}` : "");
       frameWidth = data.frame_size?.width || frameWidth;
       frameHeight = data.frame_size?.height || frameHeight;
-      roi = data.roi || null;
-      renderRoi();
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Unable to load status.");
+      if (!dragMode) {
+        roi = data.roi || null;
+        renderRoi();
+      } else {
+        pendingStatusRefresh = true;
+      }
+    } catch (_error) {
+      // Keep the UI minimal and silent.
     } finally {
       refreshInFlight = false;
     }
   }
 
-  async function postAction(url) {
+  async function postAction(url, body) {
     if (actionInFlight) {
       return;
     }
@@ -125,27 +143,194 @@
     actionInFlight = true;
     setButtonsDisabled(true);
     try {
-      const response = await fetch(url, { method: "POST" });
-      if (!response.ok) {
-        throw new Error(`Action failed (${response.status})`);
+      const response = await fetch(url, {
+        method: "POST",
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (response.ok) {
+        await refreshStatus();
       }
-
-      await refreshStatus();
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Action failed.");
+    } catch (_error) {
+      // Keep the UI minimal and silent.
     } finally {
       setButtonsDisabled(false);
       actionInFlight = false;
     }
   }
 
+  function pointerPosition(event) {
+    const rect = streamShell.getBoundingClientRect();
+    return {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
+  }
+
+  async function updateRoiOnServer(x, y, width, height) {
+    const response = await fetch(roiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ x, y, width, height }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const data = await response.json();
+    frameWidth = data.frame_size?.width || frameWidth;
+    frameHeight = data.frame_size?.height || frameHeight;
+    roi = data.roi || roi;
+    renderRoi();
+    await refreshStatus();
+  }
+
   resetBackgroundButton.addEventListener("click", function () {
     postAction(resetBackgroundUrl);
   });
 
-  resetCountButton.addEventListener("click", function () {
-    postAction(resetCountUrl);
+  if (resetCountButton) {
+    resetCountButton.addEventListener("click", function () {
+      postAction(resetCountUrl);
+    });
+  }
+
+  document.addEventListener("keydown", function (event) {
+    if (event.code !== "Space") {
+      return;
+    }
+
+    event.preventDefault();
+    postAction(resetBackgroundUrl);
   });
+
+  roiBox.addEventListener("pointerdown", function (event) {
+    if (event.target === roiHandle || !roi) {
+      return;
+    }
+
+    const viewport = getImageViewport();
+    if (!viewport) {
+      return;
+    }
+
+    dragMode = "move";
+    pendingStatusRefresh = false;
+    roiBox.classList.add("dragging");
+
+    const pos = pointerPosition(event);
+    dragOffsetX = pos.x - (viewport.left + scaleX(roi.top_left.x));
+    dragOffsetY = pos.y - (viewport.top + scaleY(roi.top_left.y));
+    roiBox.setPointerCapture(event.pointerId);
+  });
+
+  roiHandle.addEventListener("pointerdown", function (event) {
+    if (!roi) {
+      return;
+    }
+
+    event.stopPropagation();
+    dragMode = "resize";
+    pendingStatusRefresh = false;
+    roiBox.classList.add("resizing");
+    resizeStart = {
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      width: roi.width,
+      height: roi.height,
+    };
+    roiBox.setPointerCapture(event.pointerId);
+  });
+
+  roiBox.addEventListener("pointermove", function (event) {
+    if (!dragMode || !roi) {
+      return;
+    }
+
+    const viewport = getImageViewport();
+    if (!viewport) {
+      return;
+    }
+
+    if (dragMode === "move") {
+      const pos = pointerPosition(event);
+      const leftPx = clamp(
+        pos.x - dragOffsetX - viewport.left,
+        0,
+        viewport.width - scaleX(roi.width),
+      );
+      const topPx = clamp(
+        pos.y - dragOffsetY - viewport.top,
+        0,
+        viewport.height - scaleY(roi.height),
+      );
+      const nextX = pxToFrameX(leftPx);
+      const nextY = pxToFrameY(topPx);
+      roi = {
+        ...roi,
+        top_left: { x: nextX, y: nextY },
+        bottom_right: { x: nextX + roi.width, y: nextY + roi.height },
+      };
+    }
+
+    if (dragMode === "resize" && resizeStart) {
+      const deltaWidth = pxToFrameX(event.clientX - resizeStart.pointerX);
+      const deltaHeight = pxToFrameY(event.clientY - resizeStart.pointerY);
+      const maxWidth = frameWidth - roi.top_left.x;
+      const maxHeight = frameHeight - roi.top_left.y;
+      const nextWidth = clamp(resizeStart.width + deltaWidth, minRoiSize, maxWidth);
+      const nextHeight = clamp(
+        resizeStart.height + deltaHeight,
+        minRoiSize,
+        maxHeight,
+      );
+      roi = {
+        ...roi,
+        width: nextWidth,
+        height: nextHeight,
+        bottom_right: {
+          x: roi.top_left.x + nextWidth,
+          y: roi.top_left.y + nextHeight,
+        },
+      };
+    }
+
+    renderRoi();
+  });
+
+  async function finishDrag(event) {
+    if (!dragMode || !roi) {
+      return;
+    }
+
+    dragMode = null;
+    roiBox.classList.remove("dragging");
+    roiBox.classList.remove("resizing");
+    resizeStart = null;
+    try {
+      roiBox.releasePointerCapture(event.pointerId);
+    } catch (_error) {
+      // no-op
+    }
+
+    try {
+      await updateRoiOnServer(
+        roi.top_left.x,
+        roi.top_left.y,
+        roi.width,
+        roi.height,
+      );
+      if (pendingStatusRefresh) {
+        pendingStatusRefresh = false;
+        await refreshStatus();
+      }
+    } catch (_error) {
+      // Keep the UI minimal and silent.
+    }
+  }
+
+  roiBox.addEventListener("pointerup", finishDrag);
+  roiBox.addEventListener("pointercancel", finishDrag);
 
   window.addEventListener("resize", renderRoi);
   streamEl.addEventListener("load", renderRoi);

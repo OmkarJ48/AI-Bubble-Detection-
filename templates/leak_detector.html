@@ -14,33 +14,31 @@
     data-stream-url="/stream.mjpg"
     data-reset-background-url="/reset-background"
     data-reset-count-url="/reset-count"
+    data-roi-url="/roi"
   >
-    <section class="panel leak-detector-panel" aria-label="Leak detector controls">
-      <div id="stream-shell" class="stream-shell">
-        <img
-          id="stream"
-          class="stream"
-          src="/stream.mjpg"
-          alt="Leak detector live camera"
-        >
-        <div id="roi-box" class="roi-box" hidden aria-hidden="true"></div>
-      </div>
+    <section class="leak-detector-panel" aria-label="Leak detector controls">
+      <div class="top-row">
+        <div id="stream-shell" class="stream-shell">
+          <img
+            id="stream"
+            class="stream"
+            src="/stream.mjpg"
+            alt=""
+          >
+          <div id="roi-box" class="roi-box" hidden aria-hidden="true">
+            <div id="roi-handle" class="roi-handle" aria-hidden="true"></div>
+          </div>
+        </div>
 
-      <div class="count-card">
-        <span class="count-label">Count</span>
-        <span id="count" class="count-value">0</span>
+        <div class="action-row">
+          <button id="reset-background-button" class="btn btn-primary" type="button">
+            Reset Background
+          </button>
+          <button id="reset-count-button" class="btn" type="button">
+            Reset Count
+          </button>
+        </div>
       </div>
-
-      <div class="action-row">
-        <button id="reset-background-button" class="btn btn-primary" type="button">
-          Reset Background
-        </button>
-        <button id="reset-count-button" class="btn btn-danger" type="button">
-          Reset Count
-        </button>
-      </div>
-
-      <p id="camera-error" class="status-message" hidden></p>
     </section>
   </main>
 </body>

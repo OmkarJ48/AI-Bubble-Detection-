@@ -1,19 +1,11 @@
 :root {
-  --color-bg-primary: #000000;
-  --color-bg-secondary: #1a1a1a;
-  --color-text-primary: #eeeeee;
-  --color-text-muted: #999999;
-  --color-border-primary: #333333;
-  --color-border-light: #525252;
-  --color-accent: #667778;
-  --color-danger: #dc2626;
-  --color-danger-dark: #b91c1c;
-  --spacing-sm: 0.5rem;
-  --spacing-md: 1rem;
-  --spacing-lg: 1.5rem;
-  --radius-sm: 0.375rem;
-  --radius-lg: 0.75rem;
-  --radius-xl: 1rem;
+  --color-bg: #000000;
+  --color-border: #1f1f1f;
+  --color-button: #5d7c7e;
+  --color-button-hover: #6f8f91;
+  --color-text: #ffffff;
+  --radius-md: 0.9rem;
+  --radius-sm: 0.5rem;
   --transition-normal: 150ms ease;
 }
 
@@ -23,43 +15,60 @@
 
 html,
 body {
+  width: 100%;
+  height: 100%;
   margin: 0;
   padding: 0;
+  overflow: hidden;
 }
 
 body.leak-detector-page {
+  background: #000000;
+  color: var(--color-text);
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: var(--color-bg-primary);
-  color: var(--color-text-primary);
 }
 
 .leak-detector-embed {
   width: 100%;
-  max-width: 32rem;
-  padding: var(--spacing-md);
-}
-
-.panel {
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border-primary);
-  border-radius: var(--radius-xl);
-  padding: var(--spacing-lg);
+  height: 100%;
+  min-height: 0;
+  background: #000000;
+  padding: 0;
 }
 
 .leak-detector-panel {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: #000000;
   display: grid;
-  gap: var(--spacing-lg);
+  justify-items: start;
+  align-content: start;
+  gap: 0;
+  padding: 8px 10px 10px;
+}
+
+.top-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 .stream-shell {
   position: relative;
   width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
-  border: 1px solid var(--color-border-primary);
-  border-radius: var(--radius-lg);
   background: #000000;
-  aspect-ratio: 4 / 3;
   line-height: 0;
+  justify-self: center;
 }
 
 .stream {
@@ -67,113 +76,113 @@ body.leak-detector-page {
   height: 100%;
   object-fit: contain;
   display: block;
+  background: #000000;
 }
 
 .roi-box {
   position: absolute;
-  border: 3px solid #facc15;
+  border: 3px solid #000000;
   border-radius: var(--radius-sm);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
-  pointer-events: none;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.08);
+  cursor: grab;
+  touch-action: none;
 }
 
-.count-card {
-  display: grid;
-  gap: var(--spacing-sm);
-  justify-items: start;
+.roi-box.dragging {
+  cursor: grabbing;
 }
 
-.count-label {
-  color: var(--color-text-muted);
-  font-size: 0.95rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
+.roi-box.resizing {
+  cursor: nwse-resize;
 }
 
-.count-value {
-  font-size: clamp(3rem, 9vw, 4.5rem);
-  font-weight: 700;
-  line-height: 1;
-  font-variant-numeric: tabular-nums;
+.roi-handle {
+  position: absolute;
+  right: -8px;
+  bottom: -8px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #000000;
+  border: 2px solid #ffffff;
+  cursor: nwse-resize;
+  touch-action: none;
 }
 
 .action-row {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--spacing-md);
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: stretch;
+  gap: 10px;
+  width: auto;
+  padding-top: 0;
+  align-self: start;
 }
 
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: var(--spacing-sm);
-  min-height: 38px;
-  padding: 0.5rem 1rem;
-  font-size: 0.95rem;
-  font-weight: 600;
+  min-height: 44px;
+  padding: 0.75rem 1.2rem;
+  font-size: 0.98rem;
+  font-weight: 700;
   line-height: 1.2;
-  color: var(--color-text-primary);
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border-light);
+  color: var(--color-text);
+  background: #131313;
+  border: 1px solid #2c2c2c;
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition:
     background-color var(--transition-normal),
     border-color var(--transition-normal),
-    color var(--transition-normal),
+    transform var(--transition-normal),
     opacity var(--transition-normal);
 }
 
 .btn:hover:not(:disabled) {
-  background: #262626;
-  border-color: #9ca3af;
+  transform: translateY(-1px);
 }
 
 .btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+  transform: none;
 }
 
 .btn.btn-primary {
-  background: var(--color-accent);
-  border-color: var(--color-accent);
-  color: #ffffff;
+  background: var(--color-button);
+  border-color: var(--color-button);
 }
 
 .btn.btn-primary:hover:not(:disabled) {
-  background: #7a8a8b;
-  border-color: #7a8a8b;
+  background: var(--color-button-hover);
+  border-color: var(--color-button-hover);
 }
 
-.btn.btn-danger {
-  background: var(--color-danger);
-  border-color: var(--color-danger);
-  color: #ffffff;
-}
-
-.btn.btn-danger:hover:not(:disabled) {
-  background: var(--color-danger-dark);
-  border-color: var(--color-danger-dark);
-}
-
-.status-message {
-  margin: 0;
-  color: #f87171;
-  font-size: 0.95rem;
-}
-
-@media (max-width: 640px) {
-  .leak-detector-embed {
-    padding: var(--spacing-sm);
+@media (max-width: 900px) {
+  .leak-detector-panel {
+    padding: 8px;
   }
 
-  .action-row {
-    flex-direction: column;
+  .top-row {
+    grid-template-columns: 1fr;
+    gap: 16px;
+    width: 100%;
+    height: 100%;
+  }
+
+  .stream-shell {
+    width: 100%;
+    min-height: 0;
   }
 
   .btn {
+    width: 100%;
+  }
+
+  .action-row {
     width: 100%;
   }
 }
