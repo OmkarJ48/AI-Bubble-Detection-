@@ -72,6 +72,7 @@ You can also change the camera index in `cv2.VideoCapture(0)` if your leak camer
 ## Troubleshooting
 
 - `ModuleNotFoundError: No module named 'cv2'`: activate the virtual environment and reinstall from `requirements.txt`
+- `ImportError: numpy.core.multiarray failed to import`: on Raspberry Pi OS, a `opencv-python` wheel from `~/.local` can conflict with the distro-provided `numpy`/`cv2` packages. Use the project `.venv`, avoid mixing in `~/.local` OpenCV installs, and prefer the system OpenCV build when the venv was created with `--system-site-packages`
 - Camera opens but no frames appear: check whether another app is already using the camera
 - Too many false detections: increase `MIN_BUBBLE_AREA`, increase `THRESHOLD_VALUE`, or stabilize lighting
 - Legitimate bubbles are missed: reduce `MIN_BUBBLE_AREA` or reduce `THRESHOLD_VALUE`
