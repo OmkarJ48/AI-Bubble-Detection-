@@ -11,10 +11,21 @@
   <main
     class="leak-detector-embed"
     data-status-url="/status"
+    data-stream-url="/stream.mjpg"
     data-reset-background-url="/reset-background"
     data-reset-count-url="/reset-count"
   >
     <section class="panel leak-detector-panel" aria-label="Leak detector controls">
+      <div id="stream-shell" class="stream-shell">
+        <img
+          id="stream"
+          class="stream"
+          src="/stream.mjpg"
+          alt="Leak detector live camera"
+        >
+        <div id="roi-box" class="roi-box" hidden aria-hidden="true"></div>
+      </div>
+
       <div class="count-card">
         <span class="count-label">Count</span>
         <span id="count" class="count-value">0</span>
