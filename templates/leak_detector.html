@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leak Detector</title>
+  <link rel="stylesheet" href="/static/leak_detector.css">
+  <script src="/static/leak_detector.js" defer></script>
+</head>
+<body class="leak-detector-page">
+  <main
+    class="leak-detector-embed"
+    data-status-url="/status"
+    data-reset-background-url="/reset-background"
+    data-reset-count-url="/reset-count"
+  >
+    <section class="panel leak-detector-panel" aria-label="Leak detector controls">
+      <div class="count-card">
+        <span class="count-label">Count</span>
+        <span id="count" class="count-value">0</span>
+      </div>
+
+      <div class="action-row">
+        <button id="reset-background-button" class="btn btn-primary" type="button">
+          Reset Background
+        </button>
+        <button id="reset-count-button" class="btn btn-danger" type="button">
+          Reset Count
+        </button>
+      </div>
+
+      <p id="camera-error" class="status-message" hidden></p>
+    </section>
+  </main>
+</body>
+</html>
