@@ -1,45 +1,43 @@
-# Ignore Python cache
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Ignore virtual environments
+# Virtual environments and local env files
+.venv/
 venv/
 env/
-.venv/
-.env/
+.env
+.env.*
+.python-version
 
-# VS Code settings (if you don’t want them in git)
-.vscode/
-
-# Byte-compiled / temporary files
-*.log
-*.tmp
-
-# Common Python tooling dirs
+# Tooling caches and reports
 .mypy_cache/
 .pytest_cache/
-.python-version
+.ruff_cache/
+.coverage
+.coverage.*
 coverage.xml
 htmlcov/
 
-# Build and distribution
+# Build artifacts
 build/
 dist/
 *.egg-info/
-node_modules/
 
-# static files
-*.json
-!tools/tailwind/package.json
-!tools/tailwind/package-lock.json
-!profiles/*.json
-*.csv
-*.pdf
-*.mp4
-!Bubbles*.mp4
-!Prototype Dataset 1/*.mp4
-*.mov
-*.MOV
-bubble_log*.jsonl
+# Editors and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Local runtime artifacts
+captures/
+outputs/
+artifacts/
+debug_frames/
+*.log
+*.tmp
+*.jsonl
+temp_frame.*

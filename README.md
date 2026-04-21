@@ -1,207 +1,77 @@
-# Raspberry Pi Bubble-Tracking Workflow
+# Leak Detector
 
-This document reflects the current code in this folder as of 2026-04-09.
+This repository currently contains a small OpenCV-based leak detection prototype for a USB webcam. The script captures a clean background frame, compares each new frame against it, and highlights motion or bubbles large enough to pass a configurable contour-area threshold.
 
-The active workflow now uses a shared precision-first tracking core:
+## Files
 
-- `livestream.py` for Raspberry Pi camera streaming
-- `test_video.py` for offline validation and tuning
-- `bubble_tracker.py` for shared tracking, detection, auto-centering, and profile utilities
+- `leak_detector.py` - main webcam leak detection script
+- `requirements.txt` - Python dependency list
+- `.gitignore` - local environment and runtime artifact exclusions
 
-## What the current workflow does
+## How It Works
 
-### Shared tracker core: `bubble_tracker.py`
+1. Open the default camera with `cv2.VideoCapture(0)`.
+2. Wait briefly for the camera exposure to settle.
+3. Capture the first blurred grayscale frame as the background.
+4. Compare each live frame to that saved background.
+5. Threshold and dilate the difference image.
+6. Draw red boxes around contours larger than `MIN_BUBBLE_AREA`.
+7. Show a live status overlay of either `STATUS: CLEAR` or `LEAK DETECTED`.
 
-- Implements one precision-first state machine for both apps.
-- States are strictly `idle`, `candidate`, and `active`.
-- Enforces one candidate and one active bubble maximum.
-- Applies strict start gating (pipe lock zone + spawn band + below exit threshold).
-- Applies direction-aware matching (downward/lateral/step limits).
-- Counts only after lock confirmation, minimum upward travel, count-band hit, and disappearance.
+## Requirements
 
-### Live camera app: `livestream.py`
-
-- Streams MJPEG video to a browser.
-- Captures still images from the web UI.
-- Uses shared tracker logic from `bubble_tracker.py`.
-- Supports fixed ROI plus optional live auto-centering.
-- Applies profile-driven tuning from `shared` + `livestream` sections.
-
-### Video test harness: `test_video.py`
-
-- Reads an input video (`Bubbles.mp4` by default).
-- Uses the same shared tracker logic as live mode.
-- Runs a browser view with debug controls and `/status`.
-- Supports optional auto-centering and profile-driven tuning from `shared` + `test_video`.
-- Logs ended bubble events to `bubble_log.jsonl`.
+- Python 3.10 or newer is recommended
+- A connected webcam or USB camera
+- A desktop session that can display OpenCV windows via `cv2.imshow`
 
 ## Setup
 
-The dependency file is one directory above this folder.
+### Windows PowerShell
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
+```powershell
+python -m venv .venv
+venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r ../requirements.txt
+python -m pip install -r requirements.txt
+python leak_detector.py
 ```
 
-## Live camera app
+If script execution is blocked when activating the virtual environment, run:
 
-### Run `livestream.py`
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
 
-Default run:
+### Linux or macOS
 
 ```bash
-python3 livestream.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python leak_detector.py
 ```
 
-Example with explicit host, port, resolution, and FPS:
+## Usage Notes
 
-```bash
-python3 livestream.py --host 0.0.0.0 --port 5000 --resolution 960 540 --fps 30
-```
+- Start the program while the water and camera view are as still as possible.
+- The first good frame becomes the reference background.
+- Press `r` to recapture the background if the lighting changes or the camera moves.
+- Press `q` to quit.
 
-Example with profile + stream-name selection:
+## Tunable Parameters
 
-```bash
-python3 livestream.py --profile profiles/Bubbles2.json --stream-name livestream
-```
+The current script keeps its configuration at the top of `main()`:
 
-Current CLI flags:
+- `MIN_BUBBLE_AREA` filters out tiny contours caused by noise
+- `THRESHOLD_VALUE` controls how different a pixel must be from the background to count as motion
+- `BLUR_SIZE` smooths ripples and sensor noise before detection
 
-- `--host` / `-H` default: `127.0.0.1`
-- `--port` / `-p` default: `5000`
-- `--resolution` / `-r` default: `960 540`
-- `--fps` / `-f` default: `30`
-- `--profile` optional: explicit profile path
-- `--stream-name` default: `livestream` (used for live profile discovery)
+You can also change the camera index in `cv2.VideoCapture(0)` if your leak camera is not the default device.
 
-Live profile resolution order:
+## Troubleshooting
 
-1. explicit `--profile`
-2. `profiles/<stream_name>.json`
-3. fallback `profiles/Bubbles.json`
-
-Default browser URL:
-
-```text
-http://127.0.0.1:5000
-```
-
-### Live behavior and overlay
-
-- Camera frames are captured through Picamera2.
-- Detection runs on reduced grayscale ROI using `cv2.HoughCircles`.
-- Shared tracker rejects side acquisitions and jitter-driven track switches.
-- New tracks only start in strict start-eligible regions.
-- Count increments only after a qualified bubble disappears.
-- With debug enabled, overlay includes ROI, pipe guides, spawn band, count band, candidate/active markers, and status box with `State`.
-
-### Live routes
-
-- `GET /`
-- `GET /video_feed`
-- `GET /capture`
-
-Capture response shape:
-
-```json
-{"success": true, "filename": "image_YYYYMMDD_HHMMSS.jpg"}
-```
-
-Failure shape:
-
-```json
-{"success": false, "error": "message"}
-```
-
-## Video test harness
-
-### Run `test_video.py`
-
-Default:
-
-```bash
-python3 test_video.py
-```
-
-Specific video:
-
-```bash
-python3 test_video.py --video Bubbles2.mp4
-```
-
-Specific video + explicit profile:
-
-```bash
-python3 test_video.py --video Bubbles2.mp4 --profile profiles/Bubbles2.json
-```
-
-Test profile resolution order:
-
-1. explicit `--profile`
-2. `profiles/<video_stem>.json`
-3. fallback `profiles/Bubbles.json`
-
-Default browser URL:
-
-```text
-http://127.0.0.1:5001
-```
-
-### Test routes and status
-
-- `GET /`
-- `GET /video_feed`
-- `POST /toggle_debug`
-- `POST /reset_counter`
-- `GET /status`
-
-Current status response shape:
-
-```json
-{
-  "video": "Bubbles2.mp4",
-  "profile": "profiles/Bubbles2.json",
-  "debug": true,
-  "count": 0,
-  "state": "idle",
-  "active_bubble": false,
-  "candidate_bubble": false,
-  "auto_center": true
-}
-```
-
-### Event log output
-
-- Test-harness event log: `bubble_log.jsonl`
-- Captured live still images: `image_YYYYMMDD_HHMMSS.jpg`
-
-## Profile schema and key tuning fields
-
-Profiles under `profiles/` use:
-
-```json
-{
-  "shared": {},
-  "test_video": {},
-  "livestream": {}
-}
-```
-
-Commonly tuned fields now include:
-
-- pipe geometry (`pipe_center_x_bias`, `pipe_width_ratio`, `pipe_lock_width_ratio`, `pipe_top_ratio`, `pipe_bottom_ratio`, `pipe_exit_ratio`)
-- acquisition/count bands (`spawn_band_half`, `count_band_half`, `count_band_offset`, `min_start_below_exit`)
-- tracking gates (`lock_after_frames`, `lost_after_frames`, `min_upward_travel`/`min_travel_y`)
-- match/jitter limits (`max_match_distance`, `downward_tolerance`, `max_lateral_shift`, `max_step_distance`)
-- candidate behavior (`candidate_confirm_frames`, `candidate_match_distance`, `candidate_lost_after_frames`)
-- auto-centering (`auto_center_enabled`, `auto_center_smoothing`, `center_search_width_ratio`, `auto_center_max_offset_px`)
-
-## Known environment notes
-
-- `livestream.py` requires a working Picamera2 stack on Raspberry Pi.
-- Both scripts require compatible OpenCV/NumPy wheels.
-- If OpenCV import fails, rebuild the venv and reinstall from `../requirements.txt`.
-
+- `ModuleNotFoundError: No module named 'cv2'`: activate the virtual environment and reinstall from `requirements.txt`
+- Camera opens but no frames appear: check whether another app is already using the camera
+- Too many false detections: increase `MIN_BUBBLE_AREA`, increase `THRESHOLD_VALUE`, or stabilize lighting
+- Legitimate bubbles are missed: reduce `MIN_BUBBLE_AREA` or reduce `THRESHOLD_VALUE`
