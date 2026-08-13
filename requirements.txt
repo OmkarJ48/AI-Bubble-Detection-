@@ -1,3 +1,17 @@
-opencv-python>=4.10,<5
+# pip-installable dependencies only.
+#
+# picamera2 and libcamera are NOT listed here on purpose: they are system packages
+# on Raspberry Pi OS and cannot be installed correctly with pip. Install them first:
+#
+#   sudo apt install -y python3-libcamera python3-picamera2
+#
+# then create the venv with --system-site-packages so it can import them. See README.
+
 fastapi>=0.115,<1
 uvicorn>=0.30,<1
+
+# If you installed the distro build (sudo apt install -y python3-opencv) and created
+# the venv with --system-site-packages, comment this line out. Installing the pip
+# wheel on top of the distro build is the usual cause of the
+# "numpy.core.multiarray failed to import" error described in the README.
+opencv-python>=4.10,<5

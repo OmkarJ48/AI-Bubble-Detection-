@@ -32,12 +32,27 @@ dist/
 Thumbs.db
 .DS_Store
 
-# Local runtime artifacts
+# Local runtime artifacts (captured frames, recordings, logs)
 captures/
 outputs/
 artifacts/
 debug_frames/
+temp_frame.*
 *.log
 *.tmp
 *.jsonl
-temp_frame.*
+
+# Media and model weights. These belong in release assets or object storage, never
+# in git history: an earlier revision of this repo committed sample videos, model
+# weights, and a vendored C source tree, and the .git directory is still ~52 MB as a
+# result. Delete-with-force if you genuinely need to add one.
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.pt
+*.onnx
+*.tflite
+*.weights
+*.tar.xz
+*.tar.gz
