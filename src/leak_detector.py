@@ -23,7 +23,7 @@ ROI_TOP_LEFT = (279, 232)
 ROI_BOTTOM_RIGHT = (349, 302)
 JPEG_QUALITY = 85
 STREAM_BOUNDARY = "frame"
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 

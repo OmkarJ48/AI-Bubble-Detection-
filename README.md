@@ -9,16 +9,21 @@ MJPEG, where the ROI can be dragged and resized live.
 This is classical computer vision (frame differencing), not machine learning. There
 is no model in this repository.
 
-## Files
+## Project Structure
 
-| Path | Purpose |
-| --- | --- |
-| `leak_detector.py` | FastAPI service, camera capture loop, and detection logic |
-| `templates/leak_detector.html` | Single-page web UI |
-| `static/leak_detector.js` | Stream wiring, ROI drag/resize, status polling |
-| `static/leak_detector.css` | UI styling |
-| `requirements.txt` | pip-installable Python dependencies |
-| `.gitignore` | Local environment and runtime artifact exclusions |
+```
+.
+├── README.md                    # This file
+├── requirements.txt             # Python dependencies
+├── .gitignore                   # Git ignore rules
+├── src/
+│   └── leak_detector.py         # FastAPI service, camera & detection logic
+├── templates/
+│   └── leak_detector.html       # Single-page web UI
+└── static/
+    ├── leak_detector.js         # Stream wiring, ROI drag/resize, polling
+    └── leak_detector.css        # UI styling
+```
 
 ## How It Works
 
@@ -53,7 +58,7 @@ python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python leak_detector.py
+python src/leak_detector.py
 ```
 
 Then open `http://<pi-ip>:5000` in a browser. The Pi's address is printed on startup.
