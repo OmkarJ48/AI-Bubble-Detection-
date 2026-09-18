@@ -56,3 +56,7 @@ temp_frame.*
 *.weights
 *.tar.xz
 *.tar.gz
+
+# Edge Impulse models (download separately from Edge Impulse dashboard)
+models/
+!models/.gitkeep

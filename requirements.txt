@@ -7,11 +7,16 @@
 #
 # then create the venv with --system-site-packages so it can import them. See README.
 
+# Core dependencies
 fastapi>=0.115,<1
 uvicorn>=0.30,<1
-
-# If you installed the distro build (sudo apt install -y python3-opencv) and created
-# the venv with --system-site-packages, comment this line out. Installing the pip
-# wheel on top of the distro build is the usual cause of the
-# "numpy.core.multiarray failed to import" error described in the README.
 opencv-python>=4.10,<5
+numpy>=1.24,<2
+
+# Edge Impulse SDK (for AI-based detection)
+# Download from your Edge Impulse project:
+# https://docs.edgeimpulse.com/docs/run-inference/python-sdk
+# edge-impulse-linux>=1.0.0
+
+# Optional: for better performance on Pi
+# pycoral>=2.0.0  # Uncomment if using Coral TPU accelerator

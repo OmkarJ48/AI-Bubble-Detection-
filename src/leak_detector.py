@@ -1,3 +1,6 @@
+"""AI-based bubble detection service for leak detection."""
+
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -9,39 +12,43 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from picamera2 import Picamera2
 
+from camera import create_camera
+from ai_detector import EdgeImpulseDetector, FallbackDetector
 
+# Configuration
 HOST = "0.0.0.0"
 PORT = 5000
-MIN_BUBBLE_AREA = 50
-THRESHOLD_VALUE = 25
-BLUR_SIZE = (21, 21)
 FRAME_SIZE = (640, 480)
-MIN_ROI_SIZE = 20
-ROI_TOP_LEFT = (279, 232)
-ROI_BOTTOM_RIGHT = (349, 302)
 JPEG_QUALITY = 85
 STREAM_BOUNDARY = "frame"
+
+# Camera setup (override with environment variables)
+CAMERA_TYPE = os.getenv("CAMERA_TYPE", "pi")  # "pi" or "video"
+VIDEO_PATH = os.getenv("VIDEO_PATH", None)  # Path to video file if using video camera
+AI_MODEL_PATH = os.getenv("AI_MODEL_PATH", None)  # Path to Edge Impulse model
+
+# Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
+MODELS_DIR = BASE_DIR / "models"
 
 
-class LeakDetectorServer:
+class BubbleDetectionServer:
+    """AI-based bubble detection server."""
+
     def __init__(self) -> None:
-        self.picam2: Optional[Picamera2] = None
+        self.camera = None
+        self.detector = None
 
-        self.roi_x1, self.roi_y1 = ROI_TOP_LEFT
-        self.roi_x2, self.roi_y2 = ROI_BOTTOM_RIGHT
-
-        self.background_frame = None
         self.cycle_count = 0
         self.previous_leak_detected = False
         self.last_status: Optional[str] = None
         self.latest_frame_jpeg: Optional[bytes] = None
         self.last_frame_time = 0.0
         self.camera_error: Optional[str] = None
+        self.detector_error: Optional[str] = None
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -51,22 +58,48 @@ class LeakDetectorServer:
         if self._running:
             return
 
+        # Initialize camera
         try:
-            self.picam2 = Picamera2()
-            camera_config = self.picam2.create_preview_configuration(
-                main={"size": FRAME_SIZE, "format": "RGB888"}
-            )
-            self.picam2.configure(camera_config)
-            self.picam2.start()
+            self.camera = create_camera(CAMERA_TYPE, VIDEO_PATH, FRAME_SIZE)
+            self.camera.start()
+            if not self.camera.is_running():
+                self.camera_error = f"Failed to start {CAMERA_TYPE} camera"
+                print(self.camera_error)
+                return
         except Exception as exc:
             self.camera_error = str(exc)
-            print(f"Camera startup failed: {self.camera_error}")
+            print(f"Camera initialization failed: {self.camera_error}")
             return
 
-        print("Warming up Pi camera... Please ensure the water is still.")
-        time.sleep(2.0)
-        print(f"Hosting leak detector at http://<pi-ip>:{PORT}")
-        print("Background will be captured from the ROI on the first valid frame.")
+        # Initialize detector
+        try:
+            model_path = AI_MODEL_PATH or str(MODELS_DIR / "bubble_detection")
+            if Path(model_path).exists():
+                self.detector = EdgeImpulseDetector()
+                if not self.detector.load_model(model_path):
+                    print("Failed to load Edge Impulse model, falling back to classical CV")
+                    self.detector = FallbackDetector()
+            else:
+                print(f"Model path not found: {model_path}, using fallback detector")
+                self.detector = FallbackDetector()
+
+            if not self.detector.is_ready():
+                raise RuntimeError("No detector available")
+
+        except Exception as exc:
+            self.detector_error = str(exc)
+            print(f"Detector initialization failed: {self.detector_error}")
+            self.camera.stop()
+            return
+
+        camera_name = "Pi Camera" if CAMERA_TYPE == "pi" else f"Video ({VIDEO_PATH})"
+        detector_name = (
+            "Edge Impulse AI" if isinstance(self.detector, EdgeImpulseDetector) else "Classical CV"
+        )
+
+        print(f"Starting {detector_name} detection with {camera_name}...")
+        print(f"Hosting leak detector at http://<ip>:{PORT}")
+        time.sleep(1.0)
 
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
@@ -77,15 +110,9 @@ class LeakDetectorServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        if self.picam2 is not None:
-            self.picam2.stop()
-            self.picam2 = None
-
-    def reset_background(self) -> None:
-        with self._lock:
-            self.background_frame = None
-            self.previous_leak_detected = False
-        print("Background reset requested from web UI.")
+        if self.camera is not None:
+            self.camera.stop()
+            self.camera = None
 
     def reset_count(self) -> None:
         with self._lock:
@@ -93,50 +120,18 @@ class LeakDetectorServer:
             self.previous_leak_detected = False
         print("Count reset requested from web UI.")
 
-    def update_roi(self, x: int, y: int, width: int | None = None, height: int | None = None) -> dict:
-        with self._lock:
-            current_width = self.roi_x2 - self.roi_x1
-            current_height = self.roi_y2 - self.roi_y1
-
-        next_width = current_width if width is None else int(width)
-        next_height = current_height if height is None else int(height)
-        next_width = max(MIN_ROI_SIZE, min(next_width, FRAME_SIZE[0]))
-        next_height = max(MIN_ROI_SIZE, min(next_height, FRAME_SIZE[1]))
-
-        max_x = FRAME_SIZE[0] - next_width
-        max_y = FRAME_SIZE[1] - next_height
-        clamped_x = max(0, min(int(x), max_x))
-        clamped_y = max(0, min(int(y), max_y))
-
-        with self._lock:
-            self.roi_x1 = clamped_x
-            self.roi_y1 = clamped_y
-            self.roi_x2 = clamped_x + next_width
-            self.roi_y2 = clamped_y + next_height
-            self.background_frame = None
-            self.previous_leak_detected = False
-
-        print(
-            f"ROI updated to ({self.roi_x1}, {self.roi_y1}, "
-            f"{self.roi_x2 - self.roi_x1}x{self.roi_y2 - self.roi_y1}) and background reset."
-        )
-        return self.get_status_snapshot()
-
     def get_status_snapshot(self) -> dict:
         with self._lock:
             return {
-                "status": self.last_status or "WARMING UP",
+                "status": self.last_status or "INITIALIZING",
                 "count": self.cycle_count,
-                "roi": {
-                    "top_left": {"x": self.roi_x1, "y": self.roi_y1},
-                    "bottom_right": {"x": self.roi_x2, "y": self.roi_y2},
-                    "width": self.roi_x2 - self.roi_x1,
-                    "height": self.roi_y2 - self.roi_y1,
-                },
                 "frame_size": {"width": FRAME_SIZE[0], "height": FRAME_SIZE[1]},
                 "last_frame_time": self.last_frame_time,
                 "stream_ready": self.latest_frame_jpeg is not None,
                 "camera_error": self.camera_error,
+                "detector_error": self.detector_error,
+                "camera_type": CAMERA_TYPE,
+                "detector_type": type(self.detector).__name__ if self.detector else None,
             }
 
     def stream_generator(self):
@@ -155,100 +150,77 @@ class LeakDetectorServer:
             time.sleep(0.05)
 
     def _capture_loop(self) -> None:
+        """Main capture and detection loop."""
         while self._running:
-            if self.picam2 is None:
-                time.sleep(0.1)
-                continue
-            frame_rgb = self.picam2.capture_array()
-            if frame_rgb is None:
-                print("Failed to grab frame from Pi camera.")
-                time.sleep(0.1)
-                continue
-
-            with self._lock:
-                roi_x1, roi_y1 = self.roi_x1, self.roi_y1
-                roi_x2, roi_y2 = self.roi_x2, self.roi_y2
-                if self.background_frame is None:
-                    background_frame = None
-                else:
-                    background_frame = self.background_frame.copy()
-                previous_leak_detected = self.previous_leak_detected
-                cycle_count = self.cycle_count
-
-            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, BLUR_SIZE, 0)
-            roi_gray = gray[roi_y1:roi_y2, roi_x1:roi_x2]
-
-            with self._lock:
-                if self.background_frame is None:
-                    self.background_frame = roi_gray.copy()
-                    self.last_status = "STATUS: CLEAR"
-                    print("Background captured! Monitoring for leaks.")
-                    self._store_encoded_frame(frame)
+            try:
+                if not self.camera or not self.camera.is_running():
+                    time.sleep(0.1)
                     continue
 
-            frame_delta = cv2.absdiff(background_frame, roi_gray)
-            thresh = cv2.threshold(frame_delta, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)[1]
-            thresh = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(
-                thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            leak_detected = False
-            for contour in contours:
-                if cv2.contourArea(contour) < MIN_BUBBLE_AREA:
+                frame_data = self.camera.capture_frame()
+                if frame_data is None:
+                    time.sleep(0.05)
                     continue
 
-                leak_detected = True
-                x, y, w, h = cv2.boundingRect(contour)
-                cv2.rectangle(
-                    frame,
-                    (x + roi_x1, y + roi_y1),
-                    (x + roi_x1 + w, y + roi_y1 + h),
-                    (0, 0, 255),
+                frame_bgr, frame_rgb = frame_data
+
+                # Run AI detection
+                detection_result = self.detector.detect(frame_rgb)
+                leak_detected = detection_result.get("detected", False)
+                confidence = detection_result.get("confidence", 0.0)
+
+                # Draw detection boxes
+                for box in detection_result.get("boxes", []):
+                    x, y, w, h = box
+                    cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+                # Update count on state transition
+                with self._lock:
+                    if self.previous_leak_detected and not leak_detected:
+                        self.cycle_count += 1
+                        print(f"Bubble event detected. Count: {self.cycle_count}")
+
+                # Status text
+                status_text = f"DETECTION ({confidence:.1%})" if leak_detected else "CLEAR"
+                count_text = f"Count: {self.cycle_count}"
+
+                # Draw status and count on frame
+                cv2.putText(
+                    frame_bgr,
+                    status_text,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255) if leak_detected else (0, 255, 0),
+                    2,
+                )
+                text_size = cv2.getTextSize(count_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                text_x = FRAME_SIZE[0] - text_size[0] - 10
+                cv2.putText(
+                    frame_bgr,
+                    count_text,
+                    (text_x, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
                     2,
                 )
 
-            status_text = "LEAK DETECTED" if leak_detected else "STATUS: CLEAR"
+                # Encode and store frame
+                success, buffer = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                if success:
+                    with self._lock:
+                        self.latest_frame_jpeg = buffer.tobytes()
+                        self.last_frame_time = time.time()
+                        self.previous_leak_detected = leak_detected
+                        self.last_status = status_text
 
-            if previous_leak_detected and not leak_detected:
-                cycle_count += 1
-                print(f"COUNT: {cycle_count}")
-
-            count_text = f"COUNT: {cycle_count}"
-            text_size, _ = cv2.getTextSize(count_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            text_x = FRAME_SIZE[0] - text_size[0] - 10
-            cv2.putText(
-                frame,
-                count_text,
-                (text_x, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-            )
-
-            if status_text != self.last_status:
-                print(status_text)
-
-            with self._lock:
-                self.cycle_count = cycle_count
-                self.previous_leak_detected = leak_detected
-                self.last_status = status_text
-                self._store_encoded_frame(frame)
-
-    def _store_encoded_frame(self, frame) -> None:
-        success, buffer = cv2.imencode(
-            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-        )
-        if success:
-            self.latest_frame_jpeg = buffer.tobytes()
-            self.last_frame_time = time.time()
+            except Exception as exc:
+                print(f"Error in capture loop: {exc}")
+                time.sleep(0.1)
 
 
-detector = LeakDetectorServer()
+detector = BubbleDetectionServer()
 
 
 @asynccontextmanager
@@ -260,7 +232,7 @@ async def lifespan(_: FastAPI):
         detector.stop()
 
 
-app = FastAPI(title="Leak Detector", lifespan=lifespan)
+app = FastAPI(title="Bubble Detection", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -274,25 +246,10 @@ def status() -> JSONResponse:
     return JSONResponse(detector.get_status_snapshot())
 
 
-@app.post("/reset-background")
-def reset_background() -> JSONResponse:
-    detector.reset_background()
-    return JSONResponse({"ok": True})
-
-
 @app.post("/reset-count")
 def reset_count() -> JSONResponse:
     detector.reset_count()
     return JSONResponse({"ok": True})
-
-
-@app.post("/roi")
-def update_roi(payload: dict) -> JSONResponse:
-    x = payload.get("x", ROI_TOP_LEFT[0])
-    y = payload.get("y", ROI_TOP_LEFT[1])
-    width = payload.get("width")
-    height = payload.get("height")
-    return JSONResponse(detector.update_roi(x, y, width, height))
 
 
 @app.get("/stream.mjpg")

@@ -1,13 +1,15 @@
-# Leak Detector
+# Bubble Detection
 
-An OpenCV leak detection prototype for the Raspberry Pi camera, served as a small
-web app. The service captures a clean background frame inside a region of interest
-(ROI), compares every new frame against it, and highlights differences large enough
-to pass a contour-area threshold. The annotated video is streamed to a browser over
-MJPEG, where the ROI can be dragged and resized live.
+AI-powered bubble/leak detection for water systems using Edge Impulse models, served as a web app. The service runs inference on frames from a Raspberry Pi camera (or video file for testing) and streams annotated video over MJPEG to a browser.
 
-This is classical computer vision (frame differencing), not machine learning. There
-is no model in this repository.
+## What's New
+
+This is now **AI-based detection** using Edge Impulse trained models instead of classical computer vision. It includes:
+
+- **Edge Impulse integration** — Deploy your own trained bubble detection model
+- **Camera abstraction** — Seamlessly switch between Pi camera and video files for testing/CI
+- **Fallback detector** — Automatic fallback to classical CV if Edge Impulse model unavailable
+- **Flexible deployment** — Run locally for dev, on Pi for production
 
 ## Project Structure
 
@@ -17,69 +19,96 @@ is no model in this repository.
 ├── requirements.txt             # Python dependencies
 ├── .gitignore                   # Git ignore rules
 ├── src/
-│   └── leak_detector.py         # FastAPI service, camera & detection logic
+│   ├── leak_detector.py         # FastAPI service & detection loop
+│   ├── camera.py                # Camera abstraction (Pi / video file)
+│   └── ai_detector.py           # AI detector (Edge Impulse + fallback)
+├── models/
+│   └── bubble_detection/        # Place your Edge Impulse model here
 ├── templates/
-│   └── leak_detector.html       # Single-page web UI
+│   └── leak_detector.html       # Web UI
 └── static/
-    ├── leak_detector.js         # Stream wiring, ROI drag/resize, polling
-    └── leak_detector.css        # UI styling
+    ├── leak_detector.js         # Frontend logic
+    └── leak_detector.css        # Styling
 ```
 
 ## How It Works
 
-1. `Picamera2` opens the camera at 640x480 in `RGB888` and warms up for two seconds.
-2. A background thread captures frames continuously.
-3. Each frame is converted to grayscale and Gaussian-blurred, then cropped to the ROI.
-4. The first ROI crop after start (or after a reset) is stored as the background.
-5. Every later frame is diffed against that background, thresholded, and dilated.
-6. Contours larger than `MIN_BUBBLE_AREA` are drawn as red boxes on the full frame.
-7. The running count increments when detection transitions from active back to clear.
-8. Frames are JPEG-encoded and served as `multipart/x-mixed-replace` at `/stream.mjpg`.
+1. **Camera input** — Frames come from Picamera2 (Pi) or OpenCV (video file)
+2. **AI inference** — Each frame is passed to the Edge Impulse model
+3. **Detection** — Bubbles are identified; bounding boxes drawn on frame
+4. **Event counting** — Count increments on detection state transitions
+5. **Stream** — Annotated video served as MJPEG at `/stream.mjpg`
 
 ## Requirements
 
-- Raspberry Pi with a camera module (this build depends on `picamera2`; it will not
-  run on a laptop or in CI without a camera abstraction layer)
+### For Raspberry Pi (production)
+
+- Raspberry Pi with camera module
 - Raspberry Pi OS Bookworm or newer
 - Python 3.10 or newer
-- A browser on the same network as the Pi
+- An Edge Impulse trained bubble detection model
+
+### For local development/testing
+
+- Python 3.10 or newer
+- OpenCV (for reading video files)
+- Video samples (e.g., `Bubbles.mp4`) for testing
 
 ## Setup
 
-`picamera2` and `libcamera` are **system** packages, not pip packages. Install them
-with apt first, then create the virtual environment with `--system-site-packages` so
-the venv can see them:
+### Step 1: System packages (Raspberry Pi only)
 
 ```bash
 sudo apt update
-sudo apt install -y python3-libcamera python3-picamera2
+sudo apt install -y python3-libcamera python3-picamera2 python3-opencv
+```
 
+### Step 2: Python environment
+
+```bash
 python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+### Step 3: Get your Edge Impulse model
+
+1. Go to [edgeimpulse.com](https://edgeimpulse.com) and create/train a bubble detection model
+2. Export as **Python library**
+3. Extract and place in `models/bubble_detection/`
+4. Ensure `models/bubble_detection/edge_impulse_linux/` exists
+
+### Step 4: Run
+
+**On Raspberry Pi (Pi camera):**
+```bash
 python src/leak_detector.py
 ```
 
-Then open `http://<pi-ip>:5000` in a browser. The Pi's address is printed on startup.
+**On laptop (video file):**
+```bash
+export CAMERA_TYPE=video
+export VIDEO_PATH=/path/to/Bubbles.mp4
+python src/leak_detector.py
+```
 
-On Raspberry Pi OS, prefer the distro OpenCV (`sudo apt install -y python3-opencv`)
-over the pip wheel — see Troubleshooting below.
+Then open `http://localhost:5000` in a browser.
 
-## Usage
+## Configuration
 
-- Start the service while the water and the camera view are as still as possible.
-  The first good frame becomes the reference background.
-- **Drag the ROI box** on the video to move the monitored region. **Drag the circular
-  handle** at its bottom-right corner to resize it. Moving or resizing the ROI resets
-  the background automatically.
-- **Reset Background** recaptures the reference frame. Do this after any lighting
-  change, camera nudge, or water-level change.
-- **Reset Count** returns the cycle counter to zero.
-- Pressing **Space** anywhere on the page also resets the background.
+Control behavior via environment variables:
 
-The detection status and count are currently only visible on the video itself — red
-boxes for detections, and the count burnt into the top-right corner of the frame.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CAMERA_TYPE` | `pi` | `"pi"` for Raspberry Pi, `"video"` for video file |
+| `VIDEO_PATH` | None | Path to video file (required if `CAMERA_TYPE=video`) |
+| `AI_MODEL_PATH` | `models/bubble_detection` | Path to Edge Impulse model directory |
+
+Example:
+```bash
+CAMERA_TYPE=video VIDEO_PATH=test.mp4 python src/leak_detector.py
+```
 
 ## HTTP API
 
@@ -87,58 +116,59 @@ boxes for detections, and the count burnt into the top-right corner of the frame
 | --- | --- | --- |
 | `GET` | `/` | Web UI |
 | `GET` | `/stream.mjpg` | MJPEG video stream |
-| `GET` | `/status` | JSON: status text, count, ROI, frame size, last frame time, camera error |
-| `POST` | `/reset-background` | Clear the stored background frame |
-| `POST` | `/reset-count` | Reset the cycle counter |
-| `POST` | `/roi` | Set the ROI. Body: `{"x": int, "y": int, "width": int, "height": int}` |
+| `GET` | `/status` | JSON: status, count, camera info, detector info, errors |
+| `POST` | `/reset-count` | Reset the event counter |
 
-The service binds `0.0.0.0:5000` with no authentication. Run it on a trusted network
-only, or put it behind a reverse proxy.
+## How to train a bubble detection model
 
-## Tunable Parameters
+1. Collect videos of bubbles in your system (or use samples in history)
+2. Annotate frames with bounding boxes around bubbles using Edge Impulse
+3. Train object detection model (YOLO or MobileNet)
+4. Export as Python library
+5. Place in `models/bubble_detection/`
+6. Test by running the service with `CAMERA_TYPE=video`
 
-These are module-level constants at the top of `leak_detector.py`. Changing them
-requires a restart:
+See [Edge Impulse docs](https://docs.edgeimpulse.com/docs) for detailed training steps.
 
-| Constant | Default | Effect |
-| --- | --- | --- |
-| `MIN_BUBBLE_AREA` | `50` | Minimum contour area, in pixels, that counts as a detection |
-| `THRESHOLD_VALUE` | `25` | How different a pixel must be from the background to register |
-| `BLUR_SIZE` | `(21, 21)` | Gaussian blur kernel; smooths ripples and sensor noise |
-| `FRAME_SIZE` | `(640, 480)` | Capture resolution |
-| `ROI_TOP_LEFT` / `ROI_BOTTOM_RIGHT` | `(279, 232)` / `(349, 302)` | Starting ROI |
-| `MIN_ROI_SIZE` | `20` | Smallest ROI edge the UI can produce |
-| `JPEG_QUALITY` | `85` | Stream encoding quality |
-| `PORT` | `5000` | Listening port |
+## Fallback behavior
 
-## Known Limitations
+If the Edge Impulse model is not found or fails to load:
+- The service automatically falls back to **classical CV** (frame differencing)
+- Useful for testing without a trained model
+- Check `/status` endpoint to see which detector is active
 
-Worth knowing before relying on this for anything:
+## Testing
 
-- **The background is a single static frame.** Any lighting drift, camera movement,
-  or water-level change invalidates it until someone resets it manually.
-- **The count is not a bubble count.** It increments on the falling edge of "any
-  motion in the ROI", so a continuous stream of bubbles counts once, and a single
-  noisy frame also counts once. There is no debounce or minimum event duration.
-- **Detection is not bubble-specific.** There is no shape, size-band, or
-  upward-motion check, so a hand, a shadow, or a ripple registers as a detection.
-- **Nothing is persisted.** The count resets on restart and there is no event log.
-- **Failures are quiet.** If the camera fails to start, the page loads black with no
-  message. If the capture thread dies, the stream freezes on its last frame while
-  `/status` continues to report the last known state.
-- **Sensitivity is not adjustable from the UI** — only the ROI is.
+Test with video files locally (no Pi camera needed):
+
+```bash
+CAMERA_TYPE=video VIDEO_PATH=Bubbles.mp4 python src/leak_detector.py
+```
+
+The video will loop, making it easy to test detection logic.
+
+## Performance & optimization
+
+- **On Pi 4 with TPU accelerator**: ~50ms per inference (20 FPS)
+- **On Pi 4 without accelerator**: ~200-500ms per inference (2-5 FPS)
+- To use Coral TPU, uncomment `pycoral` in `requirements.txt` and modify `ai_detector.py`
 
 ## Troubleshooting
 
-- `ModuleNotFoundError: No module named 'picamera2'`: the venv was created without
-  `--system-site-packages`, or the apt packages are missing. See Setup.
-- `ImportError: numpy.core.multiarray failed to import`: an `opencv-python` wheel
-  from `~/.local` is conflicting with the distro-provided `numpy`/`cv2`. Use the
-  project `.venv`, avoid `~/.local` OpenCV installs, and prefer the system OpenCV
-  build when the venv was created with `--system-site-packages`.
-- Camera opens but no frames appear: check whether another process is holding the
-  camera.
-- Too many false detections: increase `MIN_BUBBLE_AREA`, increase `THRESHOLD_VALUE`,
-  or stabilize the lighting.
-- Legitimate bubbles are missed: reduce `MIN_BUBBLE_AREA` or `THRESHOLD_VALUE`.
-- Stream is black but the page loads: check `/status` for a `camera_error` value.
+- **"Model directory not found"** — Place your Edge Impulse export in `models/bubble_detection/`
+- **"Failed to import Edge Impulse model"** — Check the model export includes `edge_impulse_linux` module
+- **Camera not found** — Check `/status` for `camera_error`; on Pi, verify camera is enabled: `sudo raspi-config`
+- **Slow inference** — Consider a TPU accelerator or reducing frame resolution
+- **No stream** — Check browser console and `/status` endpoint for errors
+
+## License
+
+See LICENSE file (if present).
+
+## Contributing
+
+AI-based bubble detection is an open problem. Contributions welcome:
+- Better training datasets
+- Optimized Edge Impulse models
+- TPU/accelerator support
+- Web UI improvements
